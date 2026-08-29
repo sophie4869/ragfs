@@ -24,12 +24,16 @@ use crate::watcher::FileWatcher;
 /// `.obsidian/`, `.git/`, and dotfiles were indexed and polluted results.
 pub(crate) struct ExcludeMatcher {
     set: globset::GlobSet,
+    root: PathBuf,
 }
 
 impl ExcludeMatcher {
-    /// Build a matcher from glob patterns. Invalid patterns are logged and
-    /// skipped rather than failing the whole index run.
-    pub(crate) fn new(patterns: &[String]) -> Self {
+    /// Build a matcher from glob patterns, rooted at `root`. Exclusion is
+    /// evaluated on the path *relative to* `root`, so a vault that itself lives
+    /// under a hidden directory (e.g. `~/.notes/vault`) is not wholly excluded
+    /// by the hidden-component rule. Invalid patterns are logged and skipped
+    /// rather than failing the whole index run.
+    pub(crate) fn new(patterns: &[String], root: &Path) -> Self {
         let mut builder = globset::GlobSetBuilder::new();
         for pattern in patterns {
             match globset::Glob::new(pattern) {
@@ -43,19 +47,26 @@ impl ExcludeMatcher {
             warn!("Failed to build exclude globset ({e}); excluding nothing by pattern");
             globset::GlobSet::empty()
         });
-        Self { set }
+        Self {
+            set,
+            root: root.to_path_buf(),
+        }
     }
 
     /// Whether `path` should be excluded from indexing.
     pub(crate) fn is_excluded(&self, path: &Path) -> bool {
-        // Hidden files/dirs: any normal component starting with '.'.
-        let hidden = path.components().any(|c| {
+        // Evaluate relative to the index root so the root's own ancestry (which
+        // the user chose to index) never triggers exclusion.
+        let rel = path.strip_prefix(&self.root).unwrap_or(path);
+
+        // Hidden files/dirs: any relative component starting with '.'.
+        let hidden = rel.components().any(|c| {
             matches!(
                 c,
                 std::path::Component::Normal(os) if os.to_string_lossy().starts_with('.')
             )
         });
-        hidden || self.set.is_match(path)
+        hidden || self.set.is_match(rel)
     }
 }
 
@@ -412,7 +423,7 @@ impl IndexerService {
             .map_err(|e| Error::Other(format!("Failed to read directory: {e}")))?;
 
         let mut entries_stream = tokio_stream::wrappers::ReadDirStream::new(entries);
-        let matcher = ExcludeMatcher::new(&self.config.exclude_patterns);
+        let matcher = ExcludeMatcher::new(&self.config.exclude_patterns, &self.root);
 
         use tokio_stream::StreamExt;
         while let Some(entry) = entries_stream.next().await {
@@ -486,7 +497,11 @@ fn scan_directory(
 ) -> usize {
     use std::fs;
 
-    fn visit_dir(dir: &Path, event_tx: &mpsc::Sender<FileEvent>, matcher: &ExcludeMatcher) -> usize {
+    fn visit_dir(
+        dir: &Path,
+        event_tx: &mpsc::Sender<FileEvent>,
+        matcher: &ExcludeMatcher,
+    ) -> usize {
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) => {
@@ -517,7 +532,7 @@ fn scan_directory(
         queued
     }
 
-    let matcher = ExcludeMatcher::new(exclude_patterns);
+    let matcher = ExcludeMatcher::new(exclude_patterns, root);
     visit_dir(root, event_tx, &matcher)
 }
 
@@ -1206,7 +1221,10 @@ mod tests {
 
         let second = indexer.process_single(&file_path).await.unwrap();
         assert_eq!(second, real_count, "force should reprocess, not skip");
-        assert_ne!(second, 999, "force must not return the stale record's count");
+        assert_ne!(
+            second, 999,
+            "force must not return the stale record's count"
+        );
     }
 
     #[tokio::test]
@@ -1226,7 +1244,10 @@ mod tests {
 
         // Unchanged hash + no force → skip → returns the (sentinel) stored count.
         let second = indexer.process_single(&file_path).await.unwrap();
-        assert_eq!(second, 999, "without force, an unchanged file should be skipped");
+        assert_eq!(
+            second, 999,
+            "without force, an unchanged file should be skipped"
+        );
     }
 
     #[tokio::test]
@@ -1448,7 +1469,9 @@ mod tests {
     fn test_low_content_chunk_keeps_real_text() {
         assert!(!is_low_content_chunk("cards-deck: AI::loss"));
         assert!(!is_low_content_chunk("## Loss function"));
-        assert!(!is_low_content_chunk("What is a loss function in machine learning?"));
+        assert!(!is_low_content_chunk(
+            "What is a loss function in machine learning?"
+        ));
         // Chinese content must be kept (alphanumeric check must count CJK).
         assert!(!is_low_content_chunk("巴黎住宿推荐"));
     }
@@ -1457,7 +1480,8 @@ mod tests {
     fn test_exclude_matcher_hidden_files_and_dirs() {
         // Hidden files/dirs must be excluded even when not named in patterns.
         // This is the bug that let .obsidian/*.json pollute the index.
-        let matcher = ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns);
+        let matcher =
+            ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns, Path::new("/"));
 
         // Files nested inside a hidden directory (e.g. a nested Obsidian vault)
         assert!(matcher.is_excluded(Path::new("/vault/Incidents/x/.obsidian/workspace.json")));
@@ -1470,15 +1494,31 @@ mod tests {
 
     #[test]
     fn test_exclude_matcher_keeps_normal_files() {
-        let matcher = ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns);
+        let matcher =
+            ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns, Path::new("/"));
 
         assert!(!matcher.is_excluded(Path::new("/vault/Photography/Milky way.md")));
         assert!(!matcher.is_excluded(Path::new("/vault/Notes/deep/sub/note.md")));
     }
 
     #[test]
+    fn test_exclude_matcher_root_under_hidden_dir() {
+        // When the index root itself lives under a hidden directory, the root's
+        // own ancestry must NOT exclude everything inside it.
+        let root = Path::new("/home/u/.notes/vault");
+        let matcher = ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns, root);
+
+        assert!(!matcher.is_excluded(Path::new("/home/u/.notes/vault/Note.md")));
+        assert!(!matcher.is_excluded(Path::new("/home/u/.notes/vault/sub/deep.md")));
+        // But a hidden dir *inside* the vault is still excluded.
+        assert!(matcher.is_excluded(Path::new("/home/u/.notes/vault/.obsidian/app.json")));
+        assert!(matcher.is_excluded(Path::new("/home/u/.notes/vault/.DS_Store")));
+    }
+
+    #[test]
     fn test_exclude_matcher_named_patterns() {
-        let matcher = ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns);
+        let matcher =
+            ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns, Path::new("/"));
 
         assert!(matcher.is_excluded(Path::new("/proj/node_modules/pkg/index.js")));
         assert!(matcher.is_excluded(Path::new("/proj/target/debug/foo")));
@@ -1487,9 +1527,9 @@ mod tests {
 
     #[test]
     fn test_exclude_matcher_custom_glob() {
-        // Custom user pattern, e.g. dropping all png/jpg via a .ragfsignore-style rule.
+        // Custom user pattern, e.g. dropping all png/jpg.
         let patterns = vec!["**/*.png".to_string(), "**/*.jpg".to_string()];
-        let matcher = ExcludeMatcher::new(&patterns);
+        let matcher = ExcludeMatcher::new(&patterns, Path::new("/"));
 
         assert!(matcher.is_excluded(Path::new("/vault/attachments/scan.png")));
         assert!(matcher.is_excluded(Path::new("/vault/a/b/photo.jpg")));

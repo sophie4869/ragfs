@@ -278,10 +278,6 @@ pub struct QueryConfig {
     #[serde(default = "default_max_limit")]
     pub max_limit: usize,
 
-    /// Enable hybrid search (vector + FTS)
-    #[serde(default = "default_hybrid")]
-    pub hybrid: bool,
-
     /// Enable reranking
     #[serde(default)]
     pub rerank: bool,
@@ -295,16 +291,16 @@ fn default_max_limit() -> usize {
     100
 }
 
-fn default_hybrid() -> bool {
-    true
-}
+// NOTE: hybrid search is currently a CLI-only opt-in (`ragfs query --hybrid`)
+// while its LanceDB FTS path is being fixed, so it is intentionally not a
+// config field — a `hybrid = true` here would not be consulted and would
+// mislead. Re-add it here (wired through to QueryExecutor) once hybrid is fixed.
 
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
             default_limit: default_limit(),
             max_limit: default_max_limit(),
-            hybrid: default_hybrid(),
             rerank: false,
         }
     }
