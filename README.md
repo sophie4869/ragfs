@@ -82,11 +82,13 @@ for search.
 git clone https://github.com/<your-fork>/ragfs.git
 cd ragfs
 
-# Build the CLI in release mode (index/query/status; no FUSE) — macOS & Linux
-cargo build --release
+# Build the CLI in release mode (index/query/status; no FUSE) — macOS & Linux.
+# Build only the `ragfs` crate; a bare `cargo build` builds the whole workspace,
+# including the Linux-only FUSE and PyO3 crates.
+cargo build -p ragfs --release
 
 # On Linux, to also build FUSE mounting:
-#   cargo build --release --features mount
+#   cargo build -p ragfs --release --features mount
 
 # Install to ~/.cargo/bin
 cargo install --path crates/ragfs
@@ -160,19 +162,22 @@ echo "<undo_id>" > ~/ragfs-mount/.ragfs/.safety/.undo
 ragfs [OPTIONS] <COMMAND>
 
 Commands:
-  mount   Mount a directory as a RAGFS filesystem
-  index   Index a directory (without mounting)
+  index   Index a directory
   query   Query the index
   status  Show index status
   config  Manage configuration
+  mount   Mount a directory as a RAGFS filesystem   (only in --features mount builds; Linux)
 
 Options:
   -c, --config <FILE>    Config file path [default: ~/.config/ragfs/config.toml]
   -v, --verbose          Enable verbose logging
-  -f, --format <FORMAT>  Output format: text, json [default: text]
+  -f, --format <FORMAT>  Output format: text, json [default: text]  (global; precede the subcommand)
   -h, --help             Print help
   -V, --version          Print version
 ```
+
+The default build ships `index`, `query`, `status`, and `config`. `mount`
+appears only when built with `--features mount` (Linux, requires `libfuse`).
 
 ### mount
 
