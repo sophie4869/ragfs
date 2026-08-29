@@ -79,6 +79,9 @@ pub struct IndexerConfig {
     pub include_patterns: Vec<String>,
     /// Exclude patterns (glob)
     pub exclude_patterns: Vec<String>,
+    /// Reindex files even when their content hash is unchanged. Used by
+    /// `--force` and after an embedding-model change (old embeddings are stale).
+    pub force: bool,
 }
 
 impl Default for IndexerConfig {
@@ -86,6 +89,7 @@ impl Default for IndexerConfig {
         Self {
             chunk_config: ChunkConfig::default(),
             embed_config: EmbeddingConfig::default(),
+            force: false,
             include_patterns: vec!["**/*".to_string()],
             exclude_patterns: vec![
                 "**/.*".to_string(),
@@ -168,11 +172,12 @@ impl IndexerService {
         &self.root
     }
 
-    /// Start the indexer background task.
-    pub async fn start(&self) -> Result<()> {
+    /// Start the indexer background task. Returns the number of files queued by
+    /// the initial scan, so callers can wait for that many index results.
+    pub async fn start(&self) -> Result<usize> {
         let mut running = self.running.write().await;
         if *running {
-            return Ok(());
+            return Ok(0);
         }
         *running = true;
         drop(running);
@@ -308,13 +313,14 @@ impl IndexerService {
         });
 
         // Initial scan
-        self.scan().await?;
+        let queued = self.scan().await?;
 
-        Ok(())
+        Ok(queued)
     }
 
-    /// Perform initial scan of the root directory.
-    async fn scan(&self) -> Result<()> {
+    /// Perform initial scan of the root directory. Returns the number of files
+    /// queued for indexing.
+    async fn scan(&self) -> Result<usize> {
         info!("Scanning {:?}", self.root);
 
         let root = self.root.clone();
@@ -322,13 +328,13 @@ impl IndexerService {
         let exclude_patterns = self.config.exclude_patterns.clone();
 
         // Walk directory in background thread (blocking I/O)
-        tokio::task::spawn_blocking(move || {
-            scan_directory(&root, &event_tx, &exclude_patterns);
+        let queued = tokio::task::spawn_blocking(move || {
+            scan_directory(&root, &event_tx, &exclude_patterns)
         })
         .await
         .map_err(|e| Error::Other(format!("scan task failed: {e}")))?;
 
-        Ok(())
+        Ok(queued)
     }
 
     /// Process a single file through the pipeline.
@@ -473,18 +479,23 @@ fn is_low_content_chunk(content: &str) -> bool {
 }
 
 /// Scan a directory and send file events.
-fn scan_directory(root: &Path, event_tx: &mpsc::Sender<FileEvent>, exclude_patterns: &[String]) {
+fn scan_directory(
+    root: &Path,
+    event_tx: &mpsc::Sender<FileEvent>,
+    exclude_patterns: &[String],
+) -> usize {
     use std::fs;
 
-    fn visit_dir(dir: &Path, event_tx: &mpsc::Sender<FileEvent>, matcher: &ExcludeMatcher) {
+    fn visit_dir(dir: &Path, event_tx: &mpsc::Sender<FileEvent>, matcher: &ExcludeMatcher) -> usize {
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) => {
                 warn!("Cannot read directory {:?}: {}", dir, e);
-                return;
+                return 0;
             }
         };
 
+        let mut queued = 0;
         for entry in entries.flatten() {
             let path = entry.path();
 
@@ -493,18 +504,21 @@ fn scan_directory(root: &Path, event_tx: &mpsc::Sender<FileEvent>, exclude_patte
             }
 
             if path.is_dir() {
-                visit_dir(&path, event_tx, matcher);
+                queued += visit_dir(&path, event_tx, matcher);
             } else if path.is_file() {
                 // Send as Created event
                 if let Err(e) = event_tx.blocking_send(FileEvent::Created(path.clone())) {
                     warn!("Failed to queue file {:?}: {}", path, e);
+                } else {
+                    queued += 1;
                 }
             }
         }
+        queued
     }
 
     let matcher = ExcludeMatcher::new(exclude_patterns);
-    visit_dir(root, event_tx, &matcher);
+    visit_dir(root, event_tx, &matcher)
 }
 
 /// Process a file through the full pipeline: extract → chunk → embed → store.
@@ -528,8 +542,10 @@ async fn process_file(
     // Compute content hash
     let content_hash = compute_hash(path).await?;
 
-    // Check if already indexed with same hash
-    if let Ok(Some(existing)) = store.get_file(path).await
+    // Check if already indexed with same hash (unless a forced reindex is
+    // requested, e.g. after an embedding-model change).
+    if !config.force
+        && let Ok(Some(existing)) = store.get_file(path).await
         && existing.content_hash == content_hash
         && existing.status == FileStatus::Indexed
     {
@@ -1136,6 +1152,10 @@ mod tests {
     // ==================== IndexerService tests ====================
 
     fn create_test_indexer(store: Arc<dyn VectorStore>) -> IndexerService {
+        create_test_indexer_with_force(store, false)
+    }
+
+    fn create_test_indexer_with_force(store: Arc<dyn VectorStore>, force: bool) -> IndexerService {
         use ragfs_extract::TextExtractor;
 
         let mut extractors = ExtractorRegistry::new();
@@ -1150,7 +1170,10 @@ mod tests {
         let embedder = Arc::new(MockEmbedder::new(TEST_DIM));
         let embedder_pool = Arc::new(EmbedderPool::new(embedder, 1));
 
-        let config = IndexerConfig::default();
+        let config = IndexerConfig {
+            force,
+            ..Default::default()
+        };
 
         IndexerService::new(
             PathBuf::from("/tmp"),
@@ -1160,6 +1183,50 @@ mod tests {
             embedder_pool,
             config,
         )
+    }
+
+    #[tokio::test]
+    async fn test_force_reindexes_despite_unchanged_hash() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "Test content").unwrap();
+
+        let store = Arc::new(MockStore::new());
+        let indexer =
+            create_test_indexer_with_force(Arc::clone(&store) as Arc<dyn VectorStore>, true);
+
+        let real_count = indexer.process_single(&file_path).await.unwrap();
+
+        // Corrupt the stored record's chunk_count. If the second run skipped
+        // (hash unchanged), process_single would return this sentinel; a forced
+        // reindex recomputes and returns the real count instead.
+        let mut rec = store.get_file(&file_path).await.unwrap().unwrap();
+        rec.chunk_count = 999;
+        store.upsert_file(&rec).await.unwrap();
+
+        let second = indexer.process_single(&file_path).await.unwrap();
+        assert_eq!(second, real_count, "force should reprocess, not skip");
+        assert_ne!(second, 999, "force must not return the stale record's count");
+    }
+
+    #[tokio::test]
+    async fn test_without_force_skips_unchanged_hash() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "Test content").unwrap();
+
+        let store = Arc::new(MockStore::new());
+        let indexer = create_test_indexer(Arc::clone(&store) as Arc<dyn VectorStore>);
+
+        indexer.process_single(&file_path).await.unwrap();
+
+        let mut rec = store.get_file(&file_path).await.unwrap().unwrap();
+        rec.chunk_count = 999;
+        store.upsert_file(&rec).await.unwrap();
+
+        // Unchanged hash + no force → skip → returns the (sentinel) stored count.
+        let second = indexer.process_single(&file_path).await.unwrap();
+        assert_eq!(second, 999, "without force, an unchanged file should be skipped");
     }
 
     #[tokio::test]

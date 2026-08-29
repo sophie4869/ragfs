@@ -198,6 +198,36 @@ fn get_db_path(source: &PathBuf) -> Result<PathBuf> {
     Ok(data.join("indices").join(hash_str).join("index.lance"))
 }
 
+/// Path to the marker file recording which embedding model built an index.
+fn embedding_model_marker_path(db_path: &std::path::Path) -> PathBuf {
+    // db_path is `.../indices/{hash}/index.lance`; keep the marker beside it.
+    let dir = db_path.parent().unwrap_or(db_path);
+    dir.join("embedding_model")
+}
+
+/// Read the embedding model recorded for an index, if any.
+fn read_embedding_model(marker: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(marker)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Record the embedding model that built an index.
+fn write_embedding_model(marker: &std::path::Path, model: &str) -> std::io::Result<()> {
+    if let Some(dir) = marker.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(marker, model)
+}
+
+/// Whether the recorded model differs from the current one. A missing marker
+/// (fresh index) is not a change; only a *different* recorded model forces a
+/// full reindex, because the stored embeddings are then incompatible.
+fn embedding_model_changed(recorded: Option<&str>, current: &str) -> bool {
+    matches!(recorded, Some(m) if m != current)
+}
+
 /// Get the PID file path for a mount.
 ///
 /// Uses `$XDG_RUNTIME_DIR/ragfs/` if available, otherwise falls back to
@@ -444,14 +474,30 @@ async fn main() -> Result<()> {
             }
 
             let path = path.canonicalize()?;
-            info!("Indexing {:?} (force={})", path, force);
 
             let (store, extractors, chunkers, embedder) = create_components(path.clone()).await?;
+
+            // Detect an embedding-model change: the index stores model-specific
+            // vectors, so if the recorded model differs from the current one the
+            // whole index is stale and must be rebuilt.
+            let db_path = get_db_path(&path)?;
+            let marker = embedding_model_marker_path(&db_path);
+            let current_model = embedder.model_name().to_string();
+            let model_changed =
+                embedding_model_changed(read_embedding_model(&marker).as_deref(), &current_model);
+            if model_changed {
+                info!(
+                    "Embedding model changed to {current_model}; forcing a full reindex"
+                );
+            }
+            let force = force || model_changed;
+            info!("Indexing {:?} (force={})", path, force);
 
             // Create indexer config
             let config = IndexerConfig {
                 chunk_config: ChunkConfig::default(),
                 embed_config: EmbeddingConfig::default(),
+                force,
                 ..Default::default()
             };
 
@@ -489,10 +535,12 @@ async fn main() -> Result<()> {
                 (indexed, errors)
             });
 
-            // Start indexer
-            indexer.start().await.context("Failed to start indexer")?;
+            // Start indexer; `queued` is how many files the initial scan found.
+            let queued = indexer.start().await.context("Failed to start indexer")?;
 
             if watch {
+                // Record the model now (best effort) so a later run detects a swap.
+                let _ = write_embedding_model(&marker, &current_model);
                 info!("Watching for changes. Press Ctrl+C to stop.");
                 // Wait indefinitely
                 tokio::signal::ctrl_c()
@@ -500,10 +548,31 @@ async fn main() -> Result<()> {
                     .context("Failed to wait for Ctrl+C")?;
                 indexer.stop().await?;
             } else {
-                // Give some time for initial indexing
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                // Wait for the initial scan's files to actually finish indexing,
+                // rather than guessing with a fixed sleep. Each queued file emits
+                // exactly one indexed/error result.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+                loop {
+                    let s = indexer.stats().await.context("Failed to read index stats")?;
+                    if (s.indexed_files + s.error_files) as usize >= queued {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            "Indexing did not finish within the time limit ({}/{} files)",
+                            s.indexed_files + s.error_files,
+                            queued
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                }
 
-                // Check stats
+                indexer.stop().await?;
+                // Record the model that built this index (enables swap detection).
+                write_embedding_model(&marker, &current_model)
+                    .context("Failed to write embedding-model marker")?;
+
                 let stats = store.stats().await?;
                 info!(
                     "Indexing complete: {} files, {} chunks",
@@ -696,5 +765,44 @@ fn truncate(s: &str, max_len: usize) -> String {
         s
     } else {
         format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_embedding_model_changed() {
+        // Fresh index (no marker): not a change, don't force.
+        assert!(!embedding_model_changed(None, "intfloat/multilingual-e5-small"));
+        // Same model: not a change.
+        assert!(!embedding_model_changed(
+            Some("intfloat/multilingual-e5-small"),
+            "intfloat/multilingual-e5-small"
+        ));
+        // Different model (the gte -> e5 swap): change, must force reindex.
+        assert!(embedding_model_changed(
+            Some("thenlper/gte-small"),
+            "intfloat/multilingual-e5-small"
+        ));
+    }
+
+    #[test]
+    fn test_embedding_model_marker_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("indices/abc/index.lance");
+        let marker = embedding_model_marker_path(&db_path);
+
+        // Nothing recorded yet.
+        assert_eq!(read_embedding_model(&marker), None);
+
+        write_embedding_model(&marker, "intfloat/multilingual-e5-small").unwrap();
+        assert_eq!(
+            read_embedding_model(&marker).as_deref(),
+            Some("intfloat/multilingual-e5-small")
+        );
+        // Marker sits beside the index, not inside index.lance.
+        assert_eq!(marker.parent(), db_path.parent());
     }
 }
