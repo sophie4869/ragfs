@@ -1,9 +1,7 @@
 # RAGFS
 
-[![CI](https://github.com/Venere-Labs/ragfs/actions/workflows/ci.yml/badge.svg)](https://github.com/Venere-Labs/ragfs/actions/workflows/ci.yml)
-[![Security Audit](https://github.com/Venere-Labs/ragfs/actions/workflows/security.yml/badge.svg)](https://github.com/Venere-Labs/ragfs/actions/workflows/security.yml)
-[![codecov](https://codecov.io/gh/Venere-Labs/ragfs/branch/main/graph/badge.svg)](https://codecov.io/gh/Venere-Labs/ragfs)
-[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://Venere-Labs.github.io/ragfs/ragfs/)
+[![CI](https://github.com/sophie4869/ragfs/actions/workflows/ci.yml/badge.svg)](https://github.com/sophie4869/ragfs/actions/workflows/ci.yml)
+[![Security Audit](https://github.com/sophie4869/ragfs/actions/workflows/security.yml/badge.svg)](https://github.com/sophie4869/ragfs/actions/workflows/security.yml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
@@ -79,7 +77,7 @@ for search.
 
 ```bash
 # Clone the repository (this fork)
-git clone https://github.com/<your-fork>/ragfs.git
+git clone https://github.com/sophie4869/ragfs.git
 cd ragfs
 
 # Build the CLI in release mode (index/query/status; no FUSE) — macOS & Linux.
