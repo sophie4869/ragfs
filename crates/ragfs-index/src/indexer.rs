@@ -16,6 +16,49 @@ use uuid::Uuid;
 
 use crate::watcher::FileWatcher;
 
+/// Matches paths against exclusion glob patterns.
+///
+/// Always excludes hidden files and directories (any path component that starts
+/// with `.`), which is what a correct implementation of the `**/.*` default
+/// pattern would do — the previous hand-written matcher never caught them, so
+/// `.obsidian/`, `.git/`, and dotfiles were indexed and polluted results.
+pub(crate) struct ExcludeMatcher {
+    set: globset::GlobSet,
+}
+
+impl ExcludeMatcher {
+    /// Build a matcher from glob patterns. Invalid patterns are logged and
+    /// skipped rather than failing the whole index run.
+    pub(crate) fn new(patterns: &[String]) -> Self {
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in patterns {
+            match globset::Glob::new(pattern) {
+                Ok(glob) => {
+                    builder.add(glob);
+                }
+                Err(e) => warn!("Ignoring invalid exclude pattern {:?}: {}", pattern, e),
+            }
+        }
+        let set = builder.build().unwrap_or_else(|e| {
+            warn!("Failed to build exclude globset ({e}); excluding nothing by pattern");
+            globset::GlobSet::empty()
+        });
+        Self { set }
+    }
+
+    /// Whether `path` should be excluded from indexing.
+    pub(crate) fn is_excluded(&self, path: &Path) -> bool {
+        // Hidden files/dirs: any normal component starting with '.'.
+        let hidden = path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::Normal(os) if os.to_string_lossy().starts_with('.')
+            )
+        });
+        hidden || self.set.is_match(path)
+    }
+}
+
 /// Index update events.
 #[derive(Debug, Clone)]
 pub enum IndexUpdate {
@@ -363,33 +406,14 @@ impl IndexerService {
             .map_err(|e| Error::Other(format!("Failed to read directory: {e}")))?;
 
         let mut entries_stream = tokio_stream::wrappers::ReadDirStream::new(entries);
+        let matcher = ExcludeMatcher::new(&self.config.exclude_patterns);
 
         use tokio_stream::StreamExt;
         while let Some(entry) = entries_stream.next().await {
             let entry = entry.map_err(|e| Error::Other(format!("Failed to read entry: {e}")))?;
             let path = entry.path();
 
-            // Check exclusion patterns
-            let path_str = path.to_string_lossy();
-            let should_exclude = self.config.exclude_patterns.iter().any(|pattern| {
-                if pattern.contains("**") {
-                    let parts: Vec<&str> = pattern.split("**").collect();
-                    if parts.len() == 2 {
-                        let prefix = parts[0].trim_matches('/');
-                        let suffix = parts[1].trim_matches('/');
-                        (prefix.is_empty() || path_str.contains(prefix))
-                            && (suffix.is_empty() || path_str.contains(suffix))
-                    } else {
-                        false
-                    }
-                } else if pattern.starts_with('*') {
-                    path_str.ends_with(pattern.trim_start_matches('*'))
-                } else {
-                    path_str.contains(pattern.trim_matches('*'))
-                }
-            });
-
-            if should_exclude {
+            if matcher.is_excluded(&path) {
                 continue;
             }
 
@@ -441,7 +465,7 @@ impl IndexerService {
 fn scan_directory(root: &Path, event_tx: &mpsc::Sender<FileEvent>, exclude_patterns: &[String]) {
     use std::fs;
 
-    fn visit_dir(dir: &Path, event_tx: &mpsc::Sender<FileEvent>, exclude_patterns: &[String]) {
+    fn visit_dir(dir: &Path, event_tx: &mpsc::Sender<FileEvent>, matcher: &ExcludeMatcher) {
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) => {
@@ -453,33 +477,12 @@ fn scan_directory(root: &Path, event_tx: &mpsc::Sender<FileEvent>, exclude_patte
         for entry in entries.flatten() {
             let path = entry.path();
 
-            // Check exclusion patterns
-            let path_str = path.to_string_lossy();
-            let should_exclude = exclude_patterns.iter().any(|pattern| {
-                // Simple glob matching
-                if pattern.contains("**") {
-                    let parts: Vec<&str> = pattern.split("**").collect();
-                    if parts.len() == 2 {
-                        let prefix = parts[0].trim_matches('/');
-                        let suffix = parts[1].trim_matches('/');
-                        (prefix.is_empty() || path_str.contains(prefix))
-                            && (suffix.is_empty() || path_str.contains(suffix))
-                    } else {
-                        false
-                    }
-                } else if pattern.starts_with('*') {
-                    path_str.ends_with(pattern.trim_start_matches('*'))
-                } else {
-                    path_str.contains(pattern.trim_matches('*'))
-                }
-            });
-
-            if should_exclude {
+            if matcher.is_excluded(&path) {
                 continue;
             }
 
             if path.is_dir() {
-                visit_dir(&path, event_tx, exclude_patterns);
+                visit_dir(&path, event_tx, matcher);
             } else if path.is_file() {
                 // Send as Created event
                 if let Err(e) = event_tx.blocking_send(FileEvent::Created(path.clone())) {
@@ -489,7 +492,8 @@ fn scan_directory(root: &Path, event_tx: &mpsc::Sender<FileEvent>, exclude_patte
         }
     }
 
-    visit_dir(root, event_tx, exclude_patterns);
+    let matcher = ExcludeMatcher::new(exclude_patterns);
+    visit_dir(root, event_tx, &matcher);
 }
 
 /// Process a file through the full pipeline: extract → chunk → embed → store.
@@ -1340,5 +1344,48 @@ mod tests {
         let _started = IndexUpdate::IndexingStarted {
             path: PathBuf::from("/test"),
         };
+    }
+
+    #[test]
+    fn test_exclude_matcher_hidden_files_and_dirs() {
+        // Hidden files/dirs must be excluded even when not named in patterns.
+        // This is the bug that let .obsidian/*.json pollute the index.
+        let matcher = ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns);
+
+        // Files nested inside a hidden directory (e.g. a nested Obsidian vault)
+        assert!(matcher.is_excluded(Path::new("/vault/Incidents/x/.obsidian/workspace.json")));
+        assert!(matcher.is_excluded(Path::new("/vault/.obsidian")));
+        // A plain hidden file
+        assert!(matcher.is_excluded(Path::new("/vault/.DS_Store")));
+        // Inside a .git dir (multi-`**` pattern that the old matcher never caught)
+        assert!(matcher.is_excluded(Path::new("/proj/.git/config")));
+    }
+
+    #[test]
+    fn test_exclude_matcher_keeps_normal_files() {
+        let matcher = ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns);
+
+        assert!(!matcher.is_excluded(Path::new("/vault/Photography/Milky way.md")));
+        assert!(!matcher.is_excluded(Path::new("/vault/Notes/deep/sub/note.md")));
+    }
+
+    #[test]
+    fn test_exclude_matcher_named_patterns() {
+        let matcher = ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns);
+
+        assert!(matcher.is_excluded(Path::new("/proj/node_modules/pkg/index.js")));
+        assert!(matcher.is_excluded(Path::new("/proj/target/debug/foo")));
+        assert!(matcher.is_excluded(Path::new("/proj/Cargo.lock")));
+    }
+
+    #[test]
+    fn test_exclude_matcher_custom_glob() {
+        // Custom user pattern, e.g. dropping all png/jpg via a .ragfsignore-style rule.
+        let patterns = vec!["**/*.png".to_string(), "**/*.jpg".to_string()];
+        let matcher = ExcludeMatcher::new(&patterns);
+
+        assert!(matcher.is_excluded(Path::new("/vault/attachments/scan.png")));
+        assert!(matcher.is_excluded(Path::new("/vault/a/b/photo.jpg")));
+        assert!(!matcher.is_excluded(Path::new("/vault/note.md")));
     }
 }
