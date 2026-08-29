@@ -489,6 +489,42 @@ fn is_low_content_chunk(content: &str) -> bool {
     content.chars().filter(|c| c.is_alphanumeric()).count() < 3
 }
 
+fn embedding_path_context(path: &Path) -> String {
+    let title = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .trim();
+
+    let folder_parts: Vec<String> = path
+        .parent()
+        .into_iter()
+        .flat_map(|p| p.components())
+        .filter_map(|c| c.as_os_str().to_str())
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect();
+
+    let start = folder_parts.len().saturating_sub(3);
+    let folders = folder_parts[start..].join(" / ");
+
+    match (title.is_empty(), folders.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("title: {title}"),
+        (true, false) => format!("path: {folders}"),
+        (false, false) => format!("title: {title}\npath: {folders} / {title}"),
+    }
+}
+
+fn embedding_text_for_chunk(path: &Path, content: &str) -> String {
+    let context = embedding_path_context(path);
+    if context.is_empty() {
+        content.to_string()
+    } else {
+        format!("{context}\n\n{content}")
+    }
+}
+
 /// Scan a directory and send file events.
 fn scan_directory(
     root: &Path,
@@ -604,12 +640,18 @@ async fn process_file(
         return Ok(0);
     }
 
-    // Prepare texts for embedding
-    let texts: Vec<&str> = chunk_outputs.iter().map(|c| c.content.as_str()).collect();
+    // Prepare texts for embedding. Include lightweight filename/path context so
+    // title-only Obsidian notes and media notes are still discoverable, while
+    // preserving the original chunk content for snippets and storage.
+    let texts: Vec<String> = chunk_outputs
+        .iter()
+        .map(|c| embedding_text_for_chunk(path, &c.content))
+        .collect();
+    let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
 
     // Generate embeddings
     let embeddings = embedder
-        .embed_batch(&texts, &config.embed_config)
+        .embed_batch(&text_refs, &config.embed_config)
         .await
         .map_err(Error::Embedding)?;
 
@@ -1474,6 +1516,17 @@ mod tests {
         ));
         // Chinese content must be kept (alphanumeric check must count CJK).
         assert!(!is_low_content_chunk("巴黎住宿推荐"));
+    }
+
+    #[test]
+    fn test_embedding_text_includes_title_context() {
+        let path = PathBuf::from("/Users/me/Vault/03_Resources/Incidents/tripod.md");
+        let text = embedding_text_for_chunk(&path, "![[74915__20221106124710_.jpeg]]");
+
+        assert!(text.contains("title: tripod"));
+        assert!(text.contains("03_Resources / Incidents / tripod"));
+        assert!(text.contains("![[74915__20221106124710_.jpeg]]"));
+        assert!(!text.contains("/Users/me"));
     }
 
     #[test]
