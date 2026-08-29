@@ -30,6 +30,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+#[cfg(feature = "mount")]
 use daemonize::Daemonize;
 use ragfs_chunker::{ChunkerRegistry, CodeChunker, FixedSizeChunker, SemanticChunker};
 use ragfs_core::{ChunkConfig, Embedder, EmbeddingConfig, Indexer, VectorStore};
@@ -42,6 +43,7 @@ use ragfs_query::QueryExecutor;
 #[cfg(feature = "lancedb")]
 use ragfs_store::LanceStore;
 use serde::Serialize;
+#[cfg(feature = "mount")]
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,12 +54,18 @@ mod config;
 
 use config::{Config, data_dir};
 
-/// Embedding dimension for gte-small model.
+/// Embedding dimension for the multilingual-e5-small model.
 const EMBEDDING_DIM: usize = 384;
 
 #[derive(Parser)]
 #[command(name = "ragfs")]
-#[command(about = "A FUSE filesystem for RAG architectures")]
+#[command(about = "Local semantic search over your files (index, query, status)")]
+#[command(
+    long_about = "ragfs indexes a directory with local embeddings and answers \
+semantic queries against it. Runs fully offline. Optional FUSE mounting is \
+available on Linux via the `mount` build feature (see --help for the mount \
+subcommand when built with it)."
+)]
 #[command(version)]
 struct Cli {
     /// Path to config file (default: ~/.config/ragfs/config.toml)
@@ -86,6 +94,7 @@ enum OutputFormat {
 #[derive(Subcommand)]
 enum Commands {
     /// Mount a directory as a RAGFS filesystem
+    #[cfg(feature = "mount")]
     Mount {
         /// Source directory to index
         source: PathBuf,
@@ -127,6 +136,14 @@ enum Commands {
         /// Maximum results
         #[arg(short, long, default_value = "10")]
         limit: usize,
+
+        /// Use hybrid search (vector + full-text) instead of pure vector
+        /// similarity. Experimental: the LanceDB FTS index is built on the
+        /// empty table and not yet refreshed after inserts, and hybrid result
+        /// scores are not surfaced correctly, so this is off by default until
+        /// those are fixed.
+        #[arg(long)]
+        hybrid: bool,
     },
 
     /// Show index status
@@ -187,10 +204,41 @@ fn get_db_path(source: &PathBuf) -> Result<PathBuf> {
     Ok(data.join("indices").join(hash_str).join("index.lance"))
 }
 
+/// Path to the marker file recording which embedding model built an index.
+fn embedding_model_marker_path(db_path: &std::path::Path) -> PathBuf {
+    // db_path is `.../indices/{hash}/index.lance`; keep the marker beside it.
+    let dir = db_path.parent().unwrap_or(db_path);
+    dir.join("embedding_model")
+}
+
+/// Read the embedding model recorded for an index, if any.
+fn read_embedding_model(marker: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(marker)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Record the embedding model that built an index.
+fn write_embedding_model(marker: &std::path::Path, model: &str) -> std::io::Result<()> {
+    if let Some(dir) = marker.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(marker, model)
+}
+
+/// Whether the recorded model differs from the current one. A missing marker
+/// (fresh index) is not a change; only a *different* recorded model forces a
+/// full reindex, because the stored embeddings are then incompatible.
+fn embedding_model_changed(recorded: Option<&str>, current: &str) -> bool {
+    matches!(recorded, Some(m) if m != current)
+}
+
 /// Get the PID file path for a mount.
 ///
 /// Uses `$XDG_RUNTIME_DIR/ragfs/` if available, otherwise falls back to
 /// `$XDG_CACHE_HOME/ragfs/run/`.
+#[cfg(feature = "mount")]
 fn get_pid_path(source: &PathBuf) -> Result<PathBuf> {
     let hash = blake3::hash(source.to_string_lossy().as_bytes());
     let hash_str = &hash.to_hex()[..16];
@@ -211,6 +259,7 @@ fn get_pid_path(source: &PathBuf) -> Result<PathBuf> {
 }
 
 /// Get the log file path for daemon output.
+#[cfg(feature = "mount")]
 fn get_log_path(source: &PathBuf) -> Result<PathBuf> {
     let hash = blake3::hash(source.to_string_lossy().as_bytes());
     let hash_str = &hash.to_hex()[..16];
@@ -291,6 +340,7 @@ async fn main() -> Result<()> {
         .context("Failed to set tracing subscriber")?;
 
     match cli.command {
+        #[cfg(feature = "mount")]
         Commands::Mount {
             source,
             mountpoint,
@@ -430,14 +480,28 @@ async fn main() -> Result<()> {
             }
 
             let path = path.canonicalize()?;
-            info!("Indexing {:?} (force={})", path, force);
 
             let (store, extractors, chunkers, embedder) = create_components(path.clone()).await?;
+
+            // Detect an embedding-model change: the index stores model-specific
+            // vectors, so if the recorded model differs from the current one the
+            // whole index is stale and must be rebuilt.
+            let db_path = get_db_path(&path)?;
+            let marker = embedding_model_marker_path(&db_path);
+            let current_model = embedder.model_name().to_string();
+            let model_changed =
+                embedding_model_changed(read_embedding_model(&marker).as_deref(), &current_model);
+            if model_changed {
+                info!("Embedding model changed to {current_model}; forcing a full reindex");
+            }
+            let force = force || model_changed;
+            info!("Indexing {:?} (force={})", path, force);
 
             // Create indexer config
             let config = IndexerConfig {
                 chunk_config: ChunkConfig::default(),
                 embed_config: EmbeddingConfig::default(),
+                force,
                 ..Default::default()
             };
 
@@ -475,10 +539,12 @@ async fn main() -> Result<()> {
                 (indexed, errors)
             });
 
-            // Start indexer
-            indexer.start().await.context("Failed to start indexer")?;
+            // Start indexer; `queued` is how many files the initial scan found.
+            let queued = indexer.start().await.context("Failed to start indexer")?;
 
             if watch {
+                // Record the model now (best effort) so a later run detects a swap.
+                let _ = write_embedding_model(&marker, &current_model);
                 info!("Watching for changes. Press Ctrl+C to stop.");
                 // Wait indefinitely
                 tokio::signal::ctrl_c()
@@ -486,10 +552,34 @@ async fn main() -> Result<()> {
                     .context("Failed to wait for Ctrl+C")?;
                 indexer.stop().await?;
             } else {
-                // Give some time for initial indexing
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                // Wait for the initial scan's files to actually finish indexing,
+                // rather than guessing with a fixed sleep. Each queued file emits
+                // exactly one indexed/error result.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+                loop {
+                    let s = indexer
+                        .stats()
+                        .await
+                        .context("Failed to read index stats")?;
+                    if (s.indexed_files + s.error_files) as usize >= queued {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            "Indexing did not finish within the time limit ({}/{} files)",
+                            s.indexed_files + s.error_files,
+                            queued
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                }
 
-                // Check stats
+                indexer.stop().await?;
+                // Record the model that built this index (enables swap detection).
+                write_embedding_model(&marker, &current_model)
+                    .context("Failed to write embedding-model marker")?;
+
                 let stats = store.stats().await?;
                 info!(
                     "Indexing complete: {} files, {} chunks",
@@ -500,7 +590,12 @@ async fn main() -> Result<()> {
             drop(progress_handle);
         }
 
-        Commands::Query { path, query, limit } => {
+        Commands::Query {
+            path,
+            query,
+            limit,
+            hybrid,
+        } => {
             if !path.exists() {
                 anyhow::bail!("Directory does not exist: {}", path.display());
             }
@@ -527,7 +622,7 @@ async fn main() -> Result<()> {
                 store as Arc<dyn VectorStore>,
                 embedder.document_embedder(),
                 limit,
-                false, // hybrid search
+                hybrid, // opt-in; vector-only by default (see --hybrid help)
             );
 
             // Execute query
@@ -677,5 +772,47 @@ fn truncate(s: &str, max_len: usize) -> String {
         s
     } else {
         format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_embedding_model_changed() {
+        // Fresh index (no marker): not a change, don't force.
+        assert!(!embedding_model_changed(
+            None,
+            "intfloat/multilingual-e5-small"
+        ));
+        // Same model: not a change.
+        assert!(!embedding_model_changed(
+            Some("intfloat/multilingual-e5-small"),
+            "intfloat/multilingual-e5-small"
+        ));
+        // Different model (the gte -> e5 swap): change, must force reindex.
+        assert!(embedding_model_changed(
+            Some("thenlper/gte-small"),
+            "intfloat/multilingual-e5-small"
+        ));
+    }
+
+    #[test]
+    fn test_embedding_model_marker_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("indices/abc/index.lance");
+        let marker = embedding_model_marker_path(&db_path);
+
+        // Nothing recorded yet.
+        assert_eq!(read_embedding_model(&marker), None);
+
+        write_embedding_model(&marker, "intfloat/multilingual-e5-small").unwrap();
+        assert_eq!(
+            read_embedding_model(&marker).as_deref(),
+            Some("intfloat/multilingual-e5-small")
+        );
+        // Marker sits beside the index, not inside index.lance.
+        assert_eq!(marker.parent(), db_path.parent());
     }
 }

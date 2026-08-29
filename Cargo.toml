@@ -104,6 +104,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "5.0"
 mime_guess = "2.0"
 
+# File exclusion / glob matching
+globset = "0.4"
+
 # Testing
 tempfile = "3.14"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }

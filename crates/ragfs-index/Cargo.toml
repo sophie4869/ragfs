@@ -33,6 +33,7 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 mime_guess.workspace = true
+globset.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
