@@ -1,9 +1,11 @@
-//! GTE-small embedder using Candle.
+//! Multilingual e5-small embedder using Candle.
 //!
-//! Uses thenlper/gte-small model for text embeddings:
+//! Uses intfloat/multilingual-e5-small for text embeddings:
 //! - 384 dimensions
 //! - 512 max tokens
-//! - BERT architecture
+//! - BERT architecture, multilingual (EN/ZH/...)
+//! - Asymmetric prefixes: documents are encoded as `passage: ...`, queries as
+//!   `query: ...`, which is what gives e5 its retrieval discrimination.
 
 use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
@@ -18,13 +20,29 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 /// Model identifier on `HuggingFace` Hub.
-const MODEL_ID: &str = "thenlper/gte-small";
+const MODEL_ID: &str = "intfloat/multilingual-e5-small";
 
-/// Embedding dimension for gte-small.
+/// Embedding dimension for multilingual-e5-small.
 const EMBEDDING_DIM: usize = 384;
 
 /// Maximum sequence length.
 const MAX_TOKENS: usize = 512;
+
+/// Prefix e5 expects on query text.
+const QUERY_PREFIX: &str = "query: ";
+
+/// Prefix e5 expects on document/passage text.
+const PASSAGE_PREFIX: &str = "passage: ";
+
+/// Build the model input for a query (e5 asymmetric prefix).
+fn query_input(text: &str) -> String {
+    format!("{QUERY_PREFIX}{text}")
+}
+
+/// Build the model input for a document/passage (e5 asymmetric prefix).
+fn passage_input(text: &str) -> String {
+    format!("{PASSAGE_PREFIX}{text}")
+}
 
 /// GTE-small embedder using Candle.
 pub struct CandleEmbedder {
@@ -358,11 +376,15 @@ impl Embedder for CandleEmbedder {
             config.batch_size
         );
 
+        // e5 expects documents to be prefixed with "passage: ".
+        let prefixed: Vec<String> = texts.iter().map(|t| passage_input(t)).collect();
+
         // Process in batches
         let mut all_results = Vec::with_capacity(texts.len());
 
-        for chunk in texts.chunks(config.batch_size) {
-            let batch_results = self.encode_batch(chunk, config.normalize).await?;
+        for chunk in prefixed.chunks(config.batch_size) {
+            let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+            let batch_results = self.encode_batch(&refs, config.normalize).await?;
             all_results.extend(batch_results);
         }
 
@@ -374,9 +396,12 @@ impl Embedder for CandleEmbedder {
         query: &str,
         config: &EmbeddingConfig,
     ) -> Result<EmbeddingOutput, EmbedError> {
-        // For GTE models, queries and documents use the same embedding process
-        // Some models use different prefixes, but GTE doesn't need that
-        let results = self.embed_text(&[query], config).await?;
+        // e5 expects queries to be prefixed with "query: " (asymmetric to the
+        // "passage: " prefix used for documents in embed_text). We must encode
+        // directly rather than via embed_text, which would apply the passage
+        // prefix instead.
+        let input = query_input(query);
+        let results = self.encode_batch(&[input.as_str()], config.normalize).await?;
         results
             .into_iter()
             .next()
@@ -389,6 +414,25 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn test_model_is_multilingual() {
+        // The model must be multilingual so bilingual (EN/ZH) vaults retrieve
+        // sensibly; gte-small was English-only.
+        assert!(
+            MODEL_ID.contains("multilingual-e5"),
+            "expected a multilingual-e5 model, got {MODEL_ID}"
+        );
+    }
+
+    #[test]
+    fn test_e5_prefixes() {
+        // e5 models are trained with asymmetric prefixes: documents are encoded
+        // as "passage: ..." and queries as "query: ...". Applying them is what
+        // gives e5 its retrieval discrimination.
+        assert_eq!(passage_input("hello"), "passage: hello");
+        assert_eq!(query_input("what is x"), "query: what is x");
+    }
+
     #[tokio::test]
     #[ignore] // Requires model download
     async fn test_candle_embedder() {
@@ -398,7 +442,7 @@ mod tests {
         embedder.init().await.unwrap();
 
         assert_eq!(embedder.dimension(), 384);
-        assert_eq!(embedder.model_name(), "thenlper/gte-small");
+        assert_eq!(embedder.model_name(), "intfloat/multilingual-e5-small");
 
         let config = EmbeddingConfig::default();
         let texts = &["Hello world", "This is a test"];
