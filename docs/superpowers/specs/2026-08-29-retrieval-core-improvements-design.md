@@ -54,20 +54,25 @@ whose whole body is `XD6520F0` — tops every query).
 
 ### 1. Fix exclusion (required)
 
-Replace the hand-written glob in `scan_directory` (and the parallel check near
-line 374) with a real matcher. Use the `ignore` crate's `WalkBuilder`, which:
-- prunes hidden files/dirs by default,
-- respects `.gitignore` / `.ignore` automatically,
-- supports a custom ignore filename so the user can drop a `.ragfsignore` in
-  the vault.
+Replace the hand-written glob in `scan_directory` and `reindex_directory` with a
+real matcher: an `ExcludeMatcher` that compiles `exclude_patterns` via `globset`
+(correct glob semantics) plus a hidden-file rule (any path component starting
+with `.`), which is what a correct `**/.*` would do. Exclusion is evaluated on
+the path *relative to the index root*, so a vault that itself lives under a
+hidden directory (e.g. `~/.notes/vault`) is not wholly excluded. Directory
+pruning happens at the directory level (excluded dirs are not descended into).
 
-Keep the existing `exclude_patterns` config as additional overrides, compiled
-via `globset` for correct glob semantics. Directory pruning must happen at the
-directory level (do not descend into excluded dirs).
+Implemented with `globset` rather than the `ignore` crate's `WalkBuilder`: the
+two existing recursive walkers are kept, only the matcher is replaced, which is
+the smaller, more contained change and keeps the matcher unit-testable. As a
+result, `.gitignore`/`.ignore` are **not** consulted and there is **no**
+`.ragfsignore` support — the hidden-file rule plus `exclude_patterns` covers the
+`.obsidian`/`.git`/dotfile pollution this fix targets. (A future change could
+adopt `WalkBuilder` if gitignore-awareness becomes desirable.)
 
 **Acceptance:** indexing `03_Resources` indexes zero files under any
 `.obsidian/` directory and zero dotfiles; `ragfs status` file count drops
-accordingly.
+accordingly. A vault rooted under a hidden directory still indexes its files.
 
 ### 2. Skip images when no OCR (required)
 

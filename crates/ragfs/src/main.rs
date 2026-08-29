@@ -54,12 +54,18 @@ mod config;
 
 use config::{Config, data_dir};
 
-/// Embedding dimension for gte-small model.
+/// Embedding dimension for the multilingual-e5-small model.
 const EMBEDDING_DIM: usize = 384;
 
 #[derive(Parser)]
 #[command(name = "ragfs")]
-#[command(about = "A FUSE filesystem for RAG architectures")]
+#[command(about = "Local semantic search over your files (index, query, status)")]
+#[command(
+    long_about = "ragfs indexes a directory with local embeddings and answers \
+semantic queries against it. Runs fully offline. Optional FUSE mounting is \
+available on Linux via the `mount` build feature (see --help for the mount \
+subcommand when built with it)."
+)]
 #[command(version)]
 struct Cli {
     /// Path to config file (default: ~/.config/ragfs/config.toml)
@@ -486,9 +492,7 @@ async fn main() -> Result<()> {
             let model_changed =
                 embedding_model_changed(read_embedding_model(&marker).as_deref(), &current_model);
             if model_changed {
-                info!(
-                    "Embedding model changed to {current_model}; forcing a full reindex"
-                );
+                info!("Embedding model changed to {current_model}; forcing a full reindex");
             }
             let force = force || model_changed;
             info!("Indexing {:?} (force={})", path, force);
@@ -553,7 +557,10 @@ async fn main() -> Result<()> {
                 // exactly one indexed/error result.
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
                 loop {
-                    let s = indexer.stats().await.context("Failed to read index stats")?;
+                    let s = indexer
+                        .stats()
+                        .await
+                        .context("Failed to read index stats")?;
                     if (s.indexed_files + s.error_files) as usize >= queued {
                         break;
                     }
@@ -775,7 +782,10 @@ mod tests {
     #[test]
     fn test_embedding_model_changed() {
         // Fresh index (no marker): not a change, don't force.
-        assert!(!embedding_model_changed(None, "intfloat/multilingual-e5-small"));
+        assert!(!embedding_model_changed(
+            None,
+            "intfloat/multilingual-e5-small"
+        ));
         // Same model: not a change.
         assert!(!embedding_model_changed(
             Some("intfloat/multilingual-e5-small"),

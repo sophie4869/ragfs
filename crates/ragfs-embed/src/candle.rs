@@ -44,7 +44,7 @@ fn passage_input(text: &str) -> String {
     format!("{PASSAGE_PREFIX}{text}")
 }
 
-/// GTE-small embedder using Candle.
+/// Multilingual e5-small embedder using Candle.
 pub struct CandleEmbedder {
     /// Device to run inference on (CPU or CUDA)
     device: Device,
@@ -401,7 +401,9 @@ impl Embedder for CandleEmbedder {
         // directly rather than via embed_text, which would apply the passage
         // prefix instead.
         let input = query_input(query);
-        let results = self.encode_batch(&[input.as_str()], config.normalize).await?;
+        let results = self
+            .encode_batch(&[input.as_str()], config.normalize)
+            .await?;
         results
             .into_iter()
             .next()
