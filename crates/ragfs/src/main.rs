@@ -130,6 +130,14 @@ enum Commands {
         /// Maximum results
         #[arg(short, long, default_value = "10")]
         limit: usize,
+
+        /// Use hybrid search (vector + full-text) instead of pure vector
+        /// similarity. Experimental: the LanceDB FTS index is built on the
+        /// empty table and not yet refreshed after inserts, and hybrid result
+        /// scores are not surfaced correctly, so this is off by default until
+        /// those are fixed.
+        #[arg(long)]
+        hybrid: bool,
     },
 
     /// Show index status
@@ -506,7 +514,12 @@ async fn main() -> Result<()> {
             drop(progress_handle);
         }
 
-        Commands::Query { path, query, limit } => {
+        Commands::Query {
+            path,
+            query,
+            limit,
+            hybrid,
+        } => {
             if !path.exists() {
                 anyhow::bail!("Directory does not exist: {}", path.display());
             }
@@ -533,7 +546,7 @@ async fn main() -> Result<()> {
                 store as Arc<dyn VectorStore>,
                 embedder.document_embedder(),
                 limit,
-                false, // hybrid search
+                hybrid, // opt-in; vector-only by default (see --hybrid help)
             );
 
             // Execute query

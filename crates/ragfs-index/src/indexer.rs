@@ -461,6 +461,17 @@ impl IndexerService {
     }
 }
 
+/// Whether a chunk has too little real content to be worth embedding.
+///
+/// Near-empty fragments — YAML frontmatter fences (`---`), lone headers (`##`),
+/// whitespace, or punctuation — embed to almost the same vector and score ~0.95
+/// against every query, drowning the genuinely relevant chunks. We require at
+/// least a few alphanumeric characters; `char::is_alphanumeric` counts CJK
+/// ideographs, so Chinese content is preserved.
+fn is_low_content_chunk(content: &str) -> bool {
+    content.chars().filter(|c| c.is_alphanumeric()).count() < 3
+}
+
 /// Scan a directory and send file events.
 fn scan_directory(root: &Path, event_tx: &mpsc::Sender<FileEvent>, exclude_patterns: &[String]) {
     use std::fs;
@@ -550,6 +561,13 @@ async fn process_file(
         .chunk(&content, &content_type, &config.chunk_config)
         .await
         .map_err(Error::Chunking)?;
+
+    // Drop degenerate chunks (frontmatter fences, lone headers, whitespace)
+    // before embedding — they otherwise dominate every query.
+    let chunk_outputs: Vec<_> = chunk_outputs
+        .into_iter()
+        .filter(|c| !is_low_content_chunk(&c.content))
+        .collect();
 
     if chunk_outputs.is_empty() {
         return Ok(0);
@@ -1344,6 +1362,28 @@ mod tests {
         let _started = IndexUpdate::IndexingStarted {
             path: PathBuf::from("/test"),
         };
+    }
+
+    #[test]
+    fn test_low_content_chunk_drops_degenerate() {
+        // These are the chunks that poison retrieval: near-empty fragments
+        // (YAML frontmatter fences, lone headers, whitespace, punctuation) whose
+        // embeddings score ~0.95 against every query.
+        assert!(is_low_content_chunk("---"));
+        assert!(is_low_content_chunk("--- "));
+        assert!(is_low_content_chunk("---\n"));
+        assert!(is_low_content_chunk("   \n\t"));
+        assert!(is_low_content_chunk("##"));
+        assert!(is_low_content_chunk("- - -"));
+    }
+
+    #[test]
+    fn test_low_content_chunk_keeps_real_text() {
+        assert!(!is_low_content_chunk("cards-deck: AI::loss"));
+        assert!(!is_low_content_chunk("## Loss function"));
+        assert!(!is_low_content_chunk("What is a loss function in machine learning?"));
+        // Chinese content must be kept (alphanumeric check must count CJK).
+        assert!(!is_low_content_chunk("巴黎住宿推荐"));
     }
 
     #[test]
