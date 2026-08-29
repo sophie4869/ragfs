@@ -51,6 +51,7 @@ use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
 mod config;
+mod serve;
 
 use config::{Config, data_dir};
 
@@ -150,6 +151,24 @@ enum Commands {
     Status {
         /// Path to indexed directory
         path: PathBuf,
+    },
+
+    /// Run a local HTTP query server (keeps the model loaded for fast queries)
+    Serve {
+        /// Path to the indexed directory
+        path: PathBuf,
+
+        /// Port to listen on
+        #[arg(short, long, default_value = "7777")]
+        port: u16,
+
+        /// Host/interface to bind (localhost by default)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Default result limit when a request omits `limit`
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
     },
 
     /// Manage configuration
@@ -720,6 +739,42 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        }
+
+        Commands::Serve {
+            path,
+            port,
+            host,
+            limit,
+        } => {
+            if !path.exists() {
+                anyhow::bail!("Directory does not exist: {}", path.display());
+            }
+            let path = path.canonicalize()?;
+
+            let db_path = get_db_path(&path)?;
+            if !db_path.exists() {
+                anyhow::bail!(
+                    "Index not found for {}. Run 'ragfs index {}' first.",
+                    path.display(),
+                    path.display()
+                );
+            }
+
+            let (store, _extractors, _chunkers, embedder) = create_components(path.clone()).await?;
+            store.init().await.context("Failed to initialize store")?;
+            let model = embedder.model_name().to_string();
+
+            serve::run(
+                store as Arc<dyn VectorStore>,
+                embedder,
+                model,
+                path.to_string_lossy().to_string(),
+                &host,
+                port,
+                limit,
+            )
+            .await?;
         }
 
         Commands::Config { action } => {
