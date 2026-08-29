@@ -30,6 +30,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+#[cfg(feature = "mount")]
 use daemonize::Daemonize;
 use ragfs_chunker::{ChunkerRegistry, CodeChunker, FixedSizeChunker, SemanticChunker};
 use ragfs_core::{ChunkConfig, Embedder, EmbeddingConfig, Indexer, VectorStore};
@@ -42,6 +43,7 @@ use ragfs_query::QueryExecutor;
 #[cfg(feature = "lancedb")]
 use ragfs_store::LanceStore;
 use serde::Serialize;
+#[cfg(feature = "mount")]
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -86,6 +88,7 @@ enum OutputFormat {
 #[derive(Subcommand)]
 enum Commands {
     /// Mount a directory as a RAGFS filesystem
+    #[cfg(feature = "mount")]
     Mount {
         /// Source directory to index
         source: PathBuf,
@@ -191,6 +194,7 @@ fn get_db_path(source: &PathBuf) -> Result<PathBuf> {
 ///
 /// Uses `$XDG_RUNTIME_DIR/ragfs/` if available, otherwise falls back to
 /// `$XDG_CACHE_HOME/ragfs/run/`.
+#[cfg(feature = "mount")]
 fn get_pid_path(source: &PathBuf) -> Result<PathBuf> {
     let hash = blake3::hash(source.to_string_lossy().as_bytes());
     let hash_str = &hash.to_hex()[..16];
@@ -211,6 +215,7 @@ fn get_pid_path(source: &PathBuf) -> Result<PathBuf> {
 }
 
 /// Get the log file path for daemon output.
+#[cfg(feature = "mount")]
 fn get_log_path(source: &PathBuf) -> Result<PathBuf> {
     let hash = blake3::hash(source.to_string_lossy().as_bytes());
     let hash_str = &hash.to_hex()[..16];
@@ -291,6 +296,7 @@ async fn main() -> Result<()> {
         .context("Failed to set tracing subscriber")?;
 
     match cli.command {
+        #[cfg(feature = "mount")]
         Commands::Mount {
             source,
             mountpoint,
