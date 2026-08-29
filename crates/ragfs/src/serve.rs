@@ -96,7 +96,7 @@ async fn query_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<QueryResponse>, (StatusCode, String)> {
-    let query = params.get("q").map(String::as_str).unwrap_or("").trim();
+    let query = params.get("q").map_or("", String::as_str).trim();
     if query.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,

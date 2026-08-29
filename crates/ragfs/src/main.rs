@@ -139,7 +139,7 @@ enum Commands {
         limit: usize,
 
         /// Use hybrid search (vector + full-text) instead of pure vector
-        /// similarity. Experimental: the LanceDB FTS index is built on the
+        /// similarity. Experimental: the `LanceDB` FTS index is built on the
         /// empty table and not yet refreshed after inserts, and hybrid result
         /// scores are not surfaced correctly, so this is off by default until
         /// those are fixed.

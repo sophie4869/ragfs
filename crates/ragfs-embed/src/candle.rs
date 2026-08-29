@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
-use hf_hub::{Repo, RepoType, api::tokio::Api};
+use hf_hub::{Cache, Repo, RepoType, api::tokio::Api};
 use ragfs_core::{EmbedError, Embedder, EmbeddingConfig, EmbeddingOutput, Modality};
+use std::panic;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
@@ -33,6 +34,53 @@ const QUERY_PREFIX: &str = "query: ";
 
 /// Prefix e5 expects on document/passage text.
 const PASSAGE_PREFIX: &str = "passage: ";
+
+fn model_repo() -> Repo {
+    Repo::new(MODEL_ID.to_string(), RepoType::Model)
+}
+
+fn cached_model_file(cache: &Cache, repo: &Repo, filename: &str) -> Option<PathBuf> {
+    cache.repo(repo.clone()).get(filename)
+}
+
+fn create_hf_api() -> Result<Api, EmbedError> {
+    match panic::catch_unwind(Api::new) {
+        Ok(Ok(api)) => Ok(api),
+        Ok(Err(err)) => Err(EmbedError::ModelLoad(format!(
+            "Failed to create HuggingFace API: {err}"
+        ))),
+        Err(_) => Err(EmbedError::ModelLoad(
+            "Failed to create HuggingFace API: client initialization panicked".to_string(),
+        )),
+    }
+}
+
+async fn resolve_model_file(
+    cache: &Cache,
+    api: &mut Option<Api>,
+    repo: &Repo,
+    filename: &str,
+) -> Result<PathBuf, EmbedError> {
+    if let Some(path) = cached_model_file(cache, repo, filename) {
+        debug!("Using cached model file: {:?}", path);
+        return Ok(path);
+    }
+
+    if api.is_none() {
+        *api = Some(create_hf_api()?);
+    }
+
+    let api_repo = api
+        .as_ref()
+        .expect("HuggingFace API should be initialized")
+        .repo(repo.clone());
+
+    debug!("Downloading model file: {filename}");
+    api_repo
+        .get(filename)
+        .await
+        .map_err(|e| EmbedError::ModelLoad(format!("Failed to resolve {filename}: {e}")))
+}
 
 /// Build the model input for a query (e5 asymmetric prefix).
 fn query_input(text: &str) -> String {
@@ -101,32 +149,13 @@ impl CandleEmbedder {
 
         info!("Initializing CandleEmbedder with model: {}", MODEL_ID);
 
-        // Download model files from HuggingFace Hub
-        let api = Api::new()
-            .map_err(|e| EmbedError::ModelLoad(format!("Failed to create HF API: {e}")))?;
+        let cache = Cache::from_env();
+        let repo = model_repo();
+        let mut api = None;
 
-        let repo = api.repo(Repo::new(MODEL_ID.to_string(), RepoType::Model));
-
-        // Download tokenizer
-        debug!("Downloading tokenizer...");
-        let tokenizer_path = repo
-            .get("tokenizer.json")
-            .await
-            .map_err(|e| EmbedError::ModelLoad(format!("Failed to download tokenizer: {e}")))?;
-
-        // Download model config
-        debug!("Downloading config...");
-        let config_path = repo
-            .get("config.json")
-            .await
-            .map_err(|e| EmbedError::ModelLoad(format!("Failed to download config: {e}")))?;
-
-        // Download model weights
-        debug!("Downloading model weights...");
-        let weights_path = repo
-            .get("model.safetensors")
-            .await
-            .map_err(|e| EmbedError::ModelLoad(format!("Failed to download weights: {e}")))?;
+        let tokenizer_path = resolve_model_file(&cache, &mut api, &repo, "tokenizer.json").await?;
+        let config_path = resolve_model_file(&cache, &mut api, &repo, "config.json").await?;
+        let weights_path = resolve_model_file(&cache, &mut api, &repo, "model.safetensors").await?;
 
         // Load tokenizer
         debug!("Loading tokenizer...");
@@ -433,6 +462,30 @@ mod tests {
         // gives e5 its retrieval discrimination.
         assert_eq!(passage_input("hello"), "passage: hello");
         assert_eq!(query_input("what is x"), "query: what is x");
+    }
+
+    #[test]
+    fn test_cached_model_file_uses_huggingface_cache() {
+        let cache_dir = tempdir().unwrap();
+        let cache = Cache::new(cache_dir.path().to_path_buf());
+        let repo = model_repo();
+        let commit = "abc123";
+
+        cache.repo(repo.clone()).create_ref(commit).unwrap();
+
+        let path = cache_dir
+            .path()
+            .join(repo.folder_name())
+            .join("snapshots")
+            .join(commit)
+            .join("tokenizer.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+
+        assert_eq!(
+            cached_model_file(&cache, &repo, "tokenizer.json").as_deref(),
+            Some(path.as_path())
+        );
     }
 
     #[tokio::test]

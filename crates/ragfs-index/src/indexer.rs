@@ -620,7 +620,7 @@ async fn process_file(
 
     let chunks: Vec<Chunk> = chunk_outputs
         .into_iter()
-        .zip(embeddings.into_iter())
+        .zip(embeddings)
         .enumerate()
         .map(|(idx, (output, emb_output))| {
             build_chunk(
