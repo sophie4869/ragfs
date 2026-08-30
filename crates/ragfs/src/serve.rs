@@ -20,7 +20,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Max results a single request may ask for.
 const MAX_LIMIT: usize = 100;
@@ -46,6 +46,7 @@ struct AppState {
     root_path: PathBuf,
     token: Option<String>,
     query_lock: Mutex<()>,
+    aliases: SearchAliases,
 }
 
 /// Run the local query server until the process is stopped.
@@ -65,6 +66,10 @@ pub async fn run(
     let root_path = PathBuf::from(&index_path)
         .canonicalize()
         .with_context(|| format!("Failed to canonicalize index path {index_path}"))?;
+    let aliases = SearchAliases::load(&root_path);
+    if !aliases.is_empty() {
+        info!("loaded {} search aliases", aliases.len());
+    }
     let state = Arc::new(AppState {
         store,
         embedder,
@@ -74,6 +79,7 @@ pub async fn run(
         root_path,
         token,
         query_lock: Mutex::new(()),
+        aliases,
     });
 
     // Localhost-only server; a permissive CORS policy lets the Obsidian plugin
@@ -161,7 +167,7 @@ async fn query_handler(
     }
     let limit = parse_limit(params.get("limit").map(String::as_str), state.default_limit);
     let candidate_limit = candidate_limit(limit);
-    let profile = QueryProfile::new(query);
+    let profile = QueryProfile::new(query, &state.aliases);
     let search_queries = semantic_queries(query, &profile);
 
     let vector_results = {
@@ -522,11 +528,109 @@ struct QueryProfile {
 }
 
 impl QueryProfile {
-    fn new(query: &str) -> Self {
-        let terms = query_terms(query);
+    fn new(query: &str, aliases: &SearchAliases) -> Self {
+        let terms = query_terms(query, aliases);
         let phrases = query_phrases(&terms);
         Self { terms, phrases }
     }
+}
+
+#[derive(Debug, Default)]
+struct SearchAliases {
+    entries: Vec<AliasEntry>,
+}
+
+#[derive(Debug)]
+struct AliasEntry {
+    triggers: Vec<String>,
+    expansions: Vec<String>,
+}
+
+impl SearchAliases {
+    fn load(root: &Path) -> Self {
+        let mut entries = Vec::new();
+        for path in alias_files(root) {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => entries.extend(parse_aliases(&content)),
+                Err(error) => warn!("failed to read {}: {error}", path.display()),
+            }
+        }
+        Self { entries }
+    }
+
+    fn expand(&self, query: &str, terms: &[String]) -> Vec<String> {
+        let query = normalize_search_text(query);
+        let term_set = terms.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut expansions = Vec::new();
+
+        for entry in &self.entries {
+            let matches = entry.triggers.iter().any(|trigger| {
+                query.contains(trigger.as_str()) || term_set.contains(trigger.as_str())
+            });
+            if matches {
+                expansions.extend(entry.expansions.iter().cloned());
+            }
+        }
+
+        expansions
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+fn alias_files(root: &Path) -> Vec<PathBuf> {
+    root.ancestors()
+        .map(|dir| dir.join(".ragfsaliases"))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>()
+}
+
+fn parse_aliases(content: &str) -> Vec<AliasEntry> {
+    content
+        .lines()
+        .filter_map(parse_alias_line)
+        .collect::<Vec<_>>()
+}
+
+fn parse_alias_line(line: &str) -> Option<AliasEntry> {
+    let line = line
+        .split_once('#')
+        .map_or(line, |(before, _)| before)
+        .trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    let (left, right) = line
+        .split_once("=>")
+        .or_else(|| line.split_once('='))
+        .or_else(|| line.split_once(':'))?;
+    let triggers = split_alias_terms(left);
+    let expansions = split_alias_terms(right);
+
+    (!triggers.is_empty() && !expansions.is_empty()).then_some(AliasEntry {
+        triggers,
+        expansions,
+    })
+}
+
+fn split_alias_terms(input: &str) -> Vec<String> {
+    let stopwords = stopwords();
+    let mut seen = HashSet::new();
+    input
+        .split([',', '|'])
+        .flat_map(raw_terms)
+        .flat_map(|term| term_variants(&term))
+        .map(|term| normalize_search_text(&term))
+        .filter(|term| term.chars().count() >= 2 && !stopwords.contains(term.as_str()))
+        .filter(|term| seen.insert(term.clone()))
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -647,7 +751,7 @@ fn push_query(queries: &mut Vec<String>, seen: &mut HashSet<String>, query: &str
     }
 }
 
-fn query_terms(query: &str) -> Vec<String> {
+fn query_terms(query: &str, aliases: &SearchAliases) -> Vec<String> {
     let stopwords = stopwords();
     let mut seen = HashSet::new();
     let mut terms = Vec::new();
@@ -661,6 +765,11 @@ fn query_terms(query: &str) -> Vec<String> {
             {
                 terms.push(term);
             }
+        }
+    }
+    for alias in aliases.expand(query, &terms) {
+        if seen.insert(alias.clone()) {
+            terms.push(alias);
         }
     }
 
@@ -1122,7 +1231,10 @@ mod tests {
 
     #[test]
     fn test_query_terms_use_generic_variants_not_domain_aliases() {
-        let terms = query_terms("where did I save astronomy or night sky photo notes");
+        let terms = query_terms(
+            "where did I save astronomy or night sky photo notes",
+            &SearchAliases::default(),
+        );
         assert!(terms.contains(&"astronomy".to_string()));
         assert!(terms.contains(&"sky".to_string()));
         assert!(terms.contains(&"skies".to_string()));
@@ -1134,7 +1246,7 @@ mod tests {
 
     #[test]
     fn test_query_terms_extract_cjk_ngrams_from_long_queries() {
-        let terms = query_terms("关于房东纠纷我保存了哪些证据");
+        let terms = query_terms("关于房东纠纷我保存了哪些证据", &SearchAliases::default());
         assert!(terms.contains(&"房东".to_string()));
         assert!(terms.contains(&"纠纷".to_string()));
         assert!(terms.contains(&"证据".to_string()));
@@ -1142,8 +1254,66 @@ mod tests {
     }
 
     #[test]
+    fn test_search_aliases_parse_and_expand_query_terms() {
+        let aliases = SearchAliases {
+            entries: parse_aliases(
+                r"
+                房东 = landlord, tenant, lease
+                纠纷 => dispute, claim
+                # ignored
+                ",
+            ),
+        };
+        let terms = query_terms("关于房东纠纷我保存了哪些证据", &aliases);
+
+        assert!(terms.contains(&"房东".to_string()));
+        assert!(terms.contains(&"landlord".to_string()));
+        assert!(terms.contains(&"dispute".to_string()));
+        assert!(terms.contains(&"claim".to_string()));
+    }
+
+    #[test]
+    fn test_aliases_let_cross_language_lexical_rerank_win() {
+        let root = Path::new("/vault");
+        let aliases = SearchAliases {
+            entries: parse_aliases(
+                r"
+                房东 = landlord, tenant, lease
+                纠纷 = dispute, claim
+                证据 = evidence, proof, receipt, invoice
+                ",
+            ),
+        };
+        let profile = QueryProfile::new("关于房东纠纷我保存了哪些证据", &aliases);
+        let vector_results = vec![result(
+            "/vault/Incidents/2025/Evidence to keep.md",
+            0.75,
+            "screenshots and work evidence",
+            None,
+        )];
+        let lexical_results = vec![result(
+            "/vault/Incidents/dispute with landlord.md",
+            0.0,
+            "landlord claims without proof of receipts or invoices",
+            None,
+        )];
+
+        let reranked = rerank_results(&profile, vector_results, lexical_results, root, 2);
+
+        assert_eq!(
+            reranked[0].file_path,
+            PathBuf::from("/vault/Incidents/dispute with landlord.md")
+        );
+        assert!(reranked[0].metadata["match_reason"].contains("title: landlord"));
+        assert!(reranked[0].metadata["match_reason"].contains("title: dispute"));
+    }
+
+    #[test]
     fn test_semantic_queries_add_compact_query_for_long_questions() {
-        let profile = QueryProfile::new("where did I save astronomy or night sky photo notes");
+        let profile = QueryProfile::new(
+            "where did I save astronomy or night sky photo notes",
+            &SearchAliases::default(),
+        );
         let queries = semantic_queries(
             "where did I save astronomy or night sky photo notes",
             &profile,
@@ -1163,7 +1333,10 @@ mod tests {
     #[test]
     fn test_rerank_adds_path_and_content_lexical_candidates() {
         let root = Path::new("/vault");
-        let profile = QueryProfile::new("where did I save astronomy or night sky photo notes");
+        let profile = QueryProfile::new(
+            "where did I save astronomy or night sky photo notes",
+            &SearchAliases::default(),
+        );
         let vector_results = vec![result(
             "/vault/Incidents/boris.pdf",
             0.64,
@@ -1190,7 +1363,7 @@ mod tests {
     #[test]
     fn test_rerank_deduplicates_by_file() {
         let root = Path::new("/vault");
-        let profile = QueryProfile::new("query");
+        let profile = QueryProfile::new("query", &SearchAliases::default());
         let vector_results = vec![
             result("/vault/a.md", 0.70, "first chunk", None),
             result("/vault/a.md", 0.80, "better chunk", None),

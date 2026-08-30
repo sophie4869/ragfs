@@ -138,6 +138,16 @@ GET /api/files/<relative-path>
 GET /raw/<relative-path>
 ```
 
+For cross-language or personal vocabulary, add a `.ragfsaliases` file at the
+indexed root (or an ancestor). It is read when `ragfs serve` starts and does not
+require rebuilding the index:
+
+```text
+房东 = landlord, tenant, lease, rent
+纠纷 = dispute, claim, conflict
+证据 = evidence, proof, receipt, invoice
+```
+
 For a reverse-proxied or NAS deployment, keep `ragfs serve` on localhost or an
 internal network and put authentication in front of it. You can also require a
 bearer token:
