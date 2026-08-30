@@ -289,6 +289,7 @@ async fn file_handler(
 async fn raw_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
     AxumPath(path): AxumPath<String>,
 ) -> Result<Response, (StatusCode, String)> {
     require_auth(&state, &headers)?;
@@ -302,6 +303,12 @@ async fn raw_handler(
     let Some(record) = record else {
         return Err((StatusCode::NOT_FOUND, "file is not indexed".to_string()));
     };
+
+    if browser_wants_html(&headers) && is_markdown_path(&record.path) && !wants_raw(&params) {
+        let relative_path = relative_path(&record.path, &state.root_path)
+            .unwrap_or_else(|| record.path.to_string_lossy().to_string());
+        return redirect_response(&format!("/?open={}", url_query_escape(&relative_path)));
+    }
 
     let bytes = tokio::fs::read(&record.path)
         .await
@@ -965,11 +972,59 @@ fn is_text_like(mime_type: &str, path: &Path) -> bool {
         )
 }
 
+fn is_markdown_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("md" | "markdown")
+    )
+}
+
+fn browser_wants_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| {
+            accept
+                .split(',')
+                .any(|part| part.trim().starts_with("text/html"))
+        })
+}
+
+fn wants_raw(params: &HashMap<String, String>) -> bool {
+    ["raw", "download"].into_iter().any(|key| {
+        params
+            .get(key)
+            .is_some_and(|value| value != "0" && value != "false")
+    })
+}
+
+fn redirect_response(location: &str) -> Result<Response, (StatusCode, String)> {
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(header::LOCATION, location)
+        .body(Body::empty())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 fn url_path_escape(path: &str) -> String {
     path.split('/')
         .map(url_segment_escape)
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn url_query_escape(value: &str) -> String {
+    let mut escaped = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                escaped.push(byte as char);
+            }
+            b' ' => escaped.push_str("%20"),
+            _ => escaped.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    escaped
 }
 
 fn url_segment_escape(segment: &str) -> String {
@@ -1166,6 +1221,44 @@ mod tests {
             url_path_escape("Incidents/tripod note.md"),
             "Incidents/tripod%20note.md"
         );
+    }
+
+    #[test]
+    fn test_url_query_escape_encodes_path_separators_and_unicode() {
+        assert_eq!(
+            url_query_escape("Tech/AI/问题.md"),
+            "Tech%2FAI%2F%E9%97%AE%E9%A2%98.md"
+        );
+    }
+
+    #[test]
+    fn test_browser_wants_html_only_for_html_accepts() {
+        let mut headers = HeaderMap::new();
+        assert!(!browser_wants_html(&headers));
+
+        headers.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
+        assert!(!browser_wants_html(&headers));
+
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/html,application/xhtml+xml"),
+        );
+        assert!(browser_wants_html(&headers));
+    }
+
+    #[test]
+    fn test_wants_raw_accepts_raw_and_download_flags() {
+        let mut params = HashMap::new();
+        assert!(!wants_raw(&params));
+
+        params.insert("raw".to_string(), "1".to_string());
+        assert!(wants_raw(&params));
+
+        params.insert("raw".to_string(), "false".to_string());
+        assert!(!wants_raw(&params));
+
+        params.insert("download".to_string(), "true".to_string());
+        assert!(wants_raw(&params));
     }
 
     #[test]

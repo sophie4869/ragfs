@@ -160,6 +160,11 @@ function rawUrl(path) {
   return `/raw/${path.split("/").map(encodeURIComponent).join("/")}`;
 }
 
+function rawBrowserUrl(file) {
+  const url = rawUrl(file.relative_path);
+  return isMarkdown(file) ? `${url}?raw=1` : url;
+}
+
 async function fetchRawObjectUrl(path) {
   const response = await fetch(rawUrl(path), { headers: apiHeaders() });
   if (!response.ok) {
@@ -471,7 +476,7 @@ async function openFile(path) {
     const file = await requestJson(`/api/files/${path.split("/").map(encodeURIComponent).join("/")}`);
     readerTitle.textContent = file.title;
     readerPath.textContent = `${file.relative_path} · ${formatBytes(file.size_bytes)}`;
-    rawLink.href = rawUrl(file.relative_path);
+    rawLink.href = rawBrowserUrl(file);
     await renderPreview(file);
   } catch (error) {
     readerTitle.textContent = "Unable to open";
@@ -503,4 +508,10 @@ rawLink.addEventListener("click", async (event) => {
 });
 
 loadStatus();
-input.focus();
+
+const initialOpenPath = new URLSearchParams(window.location.search).get("open");
+if (initialOpenPath) {
+  openFile(initialOpenPath);
+} else {
+  input.focus();
+}
