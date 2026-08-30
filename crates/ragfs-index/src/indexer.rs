@@ -35,8 +35,18 @@ impl ExcludeMatcher {
     /// rather than failing the whole index run.
     pub(crate) fn new(patterns: &[String], root: &Path) -> Self {
         let mut builder = globset::GlobSetBuilder::new();
-        for pattern in patterns {
-            match globset::Glob::new(pattern) {
+        // Configured patterns plus any the user added in `<root>/.ragfsignore`
+        // (e.g. secret folders). The ignore file is the right place for
+        // vault-specific exclusions like a notes folder holding credentials.
+        let all = patterns.iter().cloned().chain(read_ragfsignore(root));
+        for pattern in all {
+            let normalized = normalize_exclude_pattern(&pattern);
+            // Case-insensitive so secret patterns catch `Password` and
+            // `password` alike (and macOS's filesystem is case-insensitive too).
+            match globset::GlobBuilder::new(&normalized)
+                .case_insensitive(true)
+                .build()
+            {
                 Ok(glob) => {
                     builder.add(glob);
                 }
@@ -67,6 +77,40 @@ impl ExcludeMatcher {
             )
         });
         hidden || self.set.is_match(rel)
+    }
+}
+
+/// Read glob patterns from `.ragfsignore` files at `root` and its ancestors.
+///
+/// Walking up like git means a vault-root `.ragfsignore` still protects a
+/// subfolder that is indexed on its own. One pattern per line, gitignore-style;
+/// blank lines and `#` comments are ignored. Patterns are matched against the
+/// index-root-relative path, so use `**/`-prefixed patterns (e.g. `**/Vault/**`)
+/// for portability across which directory is indexed. A trailing `/` marks a
+/// directory — see [`normalize_exclude_pattern`].
+fn read_ragfsignore(root: &Path) -> Vec<String> {
+    let mut patterns = Vec::new();
+    for dir in std::iter::successors(Some(root), |p| p.parent()) {
+        if let Ok(content) = std::fs::read_to_string(dir.join(".ragfsignore")) {
+            patterns.extend(
+                content
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(ToString::to_string),
+            );
+        }
+    }
+    patterns
+}
+
+/// Normalize an exclude pattern so a trailing `/` (a directory) matches its
+/// contents: `private/` becomes `private/**`.
+fn normalize_exclude_pattern(pattern: &str) -> String {
+    if let Some(dir) = pattern.strip_suffix('/') {
+        format!("{dir}/**")
+    } else {
+        pattern.to_string()
     }
 }
 
@@ -109,6 +153,25 @@ impl Default for IndexerConfig {
                 "**/target/**".to_string(),
                 "**/__pycache__/**".to_string(),
                 "**/*.lock".to_string(),
+                // Unambiguous secret files — never index their contents, so a
+                // networked `ragfs serve` cannot return them. Vault-specific
+                // secrets (e.g. a notes folder) belong in a `.ragfsignore`.
+                "**/*.key".to_string(),
+                "**/*.pem".to_string(),
+                "**/*.pfx".to_string(),
+                "**/*.p12".to_string(),
+                "**/*.gpg".to_string(),
+                "**/*.asc".to_string(),
+                "**/*.kdbx".to_string(),
+                "**/*.keychain".to_string(),
+                "**/*.keystore".to_string(),
+                "**/id_rsa".to_string(),
+                "**/id_dsa".to_string(),
+                "**/id_ecdsa".to_string(),
+                "**/id_ed25519".to_string(),
+                "**/*.env".to_string(),
+                "**/secrets.*".to_string(),
+                "**/credentials.*".to_string(),
             ],
         }
     }
@@ -1587,5 +1650,69 @@ mod tests {
         assert!(matcher.is_excluded(Path::new("/vault/attachments/scan.png")));
         assert!(matcher.is_excluded(Path::new("/vault/a/b/photo.jpg")));
         assert!(!matcher.is_excluded(Path::new("/vault/note.md")));
+    }
+
+    #[test]
+    fn test_default_excludes_secret_files() {
+        // Unambiguous secret files must be excluded by default so a networked
+        // `ragfs serve` never returns their contents.
+        let matcher =
+            ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns, Path::new("/"));
+
+        assert!(matcher.is_excluded(Path::new("/vault/deploy.key")));
+        assert!(matcher.is_excluded(Path::new("/vault/certs/server.pem")));
+        assert!(matcher.is_excluded(Path::new("/vault/passwords.kdbx")));
+        assert!(matcher.is_excluded(Path::new("/vault/.ssh/id_rsa")));
+        // Ordinary notes are still indexed.
+        assert!(!matcher.is_excluded(Path::new("/vault/Notes/keyboard shortcuts.md")));
+    }
+
+    #[test]
+    fn test_read_ragfsignore_parses_lines() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".ragfsignore"),
+            "# secrets\n\n**/Vault/**\n  *.env  \n# trailing comment\nprivate/\n",
+        )
+        .unwrap();
+
+        let patterns = read_ragfsignore(dir.path());
+        assert_eq!(patterns, vec!["**/Vault/**", "*.env", "private/"]);
+    }
+
+    #[test]
+    fn test_ragfsignore_missing_is_empty() {
+        let dir = tempdir().unwrap();
+        assert!(read_ragfsignore(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_ragfsignore_found_in_ancestor() {
+        // A vault-root .ragfsignore must protect a subfolder indexed on its own.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".ragfsignore"), "**/Vault/**\n").unwrap();
+        let sub = dir.path().join("03_Resources");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let matcher = ExcludeMatcher::new(&[], &sub);
+        assert!(matcher.is_excluded(&sub.join("Vault/secret.md")));
+        assert!(!matcher.is_excluded(&sub.join("Photography/note.md")));
+    }
+
+    #[test]
+    fn test_exclude_matcher_honors_ragfsignore() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".ragfsignore"), "**/Vault/**\nprivate/\n").unwrap();
+
+        // No explicit patterns — everything comes from .ragfsignore.
+        let matcher = ExcludeMatcher::new(&[], dir.path());
+
+        let secret = dir.path().join("03_Resources/Vault/backup keys.md");
+        let in_private = dir.path().join("private/notes.md");
+        let normal = dir.path().join("03_Resources/Photography/Milky way.md");
+
+        assert!(matcher.is_excluded(&secret));
+        assert!(matcher.is_excluded(&in_private)); // trailing-slash dir pattern
+        assert!(!matcher.is_excluded(&normal));
     }
 }
