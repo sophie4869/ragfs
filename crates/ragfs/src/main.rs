@@ -169,6 +169,14 @@ enum Commands {
         /// Default result limit when a request omits `limit`
         #[arg(short, long, default_value = "10")]
         limit: usize,
+
+        /// Bearer token for API requests (prefer `RAGFS_SERVE_TOKEN` for public deployments)
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Environment variable to read the bearer token from
+        #[arg(long, default_value = "RAGFS_SERVE_TOKEN")]
+        token_env: String,
     },
 
     /// Manage configuration
@@ -746,6 +754,8 @@ async fn main() -> Result<()> {
             port,
             host,
             limit,
+            token,
+            token_env,
         } => {
             if !path.exists() {
                 anyhow::bail!("Directory does not exist: {}", path.display());
@@ -764,6 +774,7 @@ async fn main() -> Result<()> {
             let (store, _extractors, _chunkers, embedder) = create_components(path.clone()).await?;
             store.init().await.context("Failed to initialize store")?;
             let model = embedder.model_name().to_string();
+            let token = token.or_else(|| std::env::var(token_env).ok());
 
             serve::run(
                 store as Arc<dyn VectorStore>,
@@ -773,6 +784,7 @@ async fn main() -> Result<()> {
                 &host,
                 port,
                 limit,
+                token,
             )
             .await?;
         }

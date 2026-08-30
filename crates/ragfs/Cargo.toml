@@ -24,6 +24,12 @@ candle = [
     "ragfs-query/candle",
     "ragfs-fuse?/candle",
 ]
+metal = [
+    "candle",
+    "ragfs-embed/metal",
+    "ragfs-index/metal",
+    "ragfs-query/metal",
+]
 lancedb = [
     "ragfs-store/lancedb",
     "ragfs-index/lancedb",
@@ -61,6 +67,7 @@ fuser = { workspace = true, optional = true }
 blake3.workspace = true
 chrono.workspace = true
 daemonize = { workspace = true, optional = true }
+mime_guess.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

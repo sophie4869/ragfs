@@ -17,6 +17,12 @@ candle = [
     "dep:hf-hub",
     "dep:tokenizers",
 ]
+metal = [
+    "candle",
+    "candle-core/metal",
+    "candle-nn/metal",
+    "candle-transformers/metal",
+]
 
 [dependencies]
 ragfs-core.workspace = true

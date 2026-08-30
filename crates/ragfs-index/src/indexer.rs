@@ -289,6 +289,7 @@ impl IndexerService {
         let chunkers = Arc::clone(&self.chunkers);
         let embedder = Arc::clone(&self.embedder);
         let config = self.config.clone();
+        let root = self.root.clone();
         let stats = Arc::clone(&self.stats);
 
         // Spawn event processing task
@@ -300,6 +301,14 @@ impl IndexerService {
                         debug!("Received file event: {:?}", event);
                         match &event {
                             FileEvent::Created(path) | FileEvent::Modified(path) => {
+                                if should_skip_watch_event(path, &root, &config) {
+                                    debug!("Skipping excluded watch event for {:?}", path);
+                                    if let Err(e) = store.delete_by_file_path(path).await {
+                                        warn!("Failed to delete excluded path {:?}: {}", path, e);
+                                    }
+                                    continue;
+                                }
+
                                 let _ = update_tx
                                     .send(IndexUpdate::IndexingStarted { path: path.clone() });
 
@@ -352,6 +361,14 @@ impl IndexerService {
                                 if let Err(e) = store.delete_by_file_path(from).await {
                                     warn!("Failed to delete old path {:?}: {}", from, e);
                                 }
+                                if should_skip_watch_event(to, &root, &config) {
+                                    debug!("Skipping excluded renamed path {:?}", to);
+                                    if let Err(e) = store.delete_by_file_path(to).await {
+                                        warn!("Failed to delete excluded path {:?}: {}", to, e);
+                                    }
+                                    continue;
+                                }
+
                                 let _ = update_tx
                                     .send(IndexUpdate::IndexingStarted { path: to.clone() });
 
@@ -586,6 +603,10 @@ fn embedding_text_for_chunk(path: &Path, content: &str) -> String {
     } else {
         format!("{context}\n\n{content}")
     }
+}
+
+fn should_skip_watch_event(path: &Path, root: &Path, config: &IndexerConfig) -> bool {
+    ExcludeMatcher::new(&config.exclude_patterns, root).is_excluded(path)
 }
 
 /// Scan a directory and send file events.
@@ -1714,5 +1735,41 @@ mod tests {
         assert!(matcher.is_excluded(&secret));
         assert!(matcher.is_excluded(&in_private)); // trailing-slash dir pattern
         assert!(!matcher.is_excluded(&normal));
+    }
+
+    #[test]
+    fn test_watch_events_honor_excludes() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".ragfsignore"), "**/Vault/**\n").unwrap();
+        let config = IndexerConfig::default();
+
+        assert!(should_skip_watch_event(
+            &dir.path().join("03_Resources/Vault/backup keys.md"),
+            dir.path(),
+            &config
+        ));
+        assert!(should_skip_watch_event(
+            &dir.path().join("03_Resources/deploy.key"),
+            dir.path(),
+            &config
+        ));
+        assert!(!should_skip_watch_event(
+            &dir.path().join("03_Resources/Photography/Milky way.md"),
+            dir.path(),
+            &config
+        ));
+    }
+
+    #[test]
+    fn test_watch_events_reread_ragfsignore() {
+        let dir = tempdir().unwrap();
+        let config = IndexerConfig::default();
+        let path = dir.path().join("private/new secret.md");
+
+        assert!(!should_skip_watch_event(&path, dir.path(), &config));
+
+        std::fs::write(dir.path().join(".ragfsignore"), "private/\n").unwrap();
+
+        assert!(should_skip_watch_event(&path, dir.path(), &config));
     }
 }

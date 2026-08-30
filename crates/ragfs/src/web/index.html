@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RAGFS</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="search-pane" aria-label="Search">
+        <header class="topbar">
+          <div>
+            <h1>RAGFS</h1>
+            <p id="statusLine">Connecting...</p>
+          </div>
+          <button id="tokenButton" class="icon-button" type="button" title="Set API token">
+            <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+              <circle cx="7.5" cy="15.5" r="3.5"></circle>
+              <path d="M10 13L20 3"></path>
+              <path d="M15 8L18 11"></path>
+              <path d="M17 6L20 9"></path>
+            </svg>
+            <span class="sr-only">Set API token</span>
+          </button>
+        </header>
+
+        <form id="searchForm" class="search-form">
+          <input
+            id="queryInput"
+            name="q"
+            type="search"
+            autocomplete="off"
+            placeholder="Search your files"
+            aria-label="Search your files"
+          />
+          <button type="submit">Search</button>
+        </form>
+
+        <ol id="results" class="results" aria-live="polite"></ol>
+      </section>
+
+      <section class="reader-pane" aria-label="Reader">
+        <div id="emptyState" class="empty-state">
+          <h2>Select a result</h2>
+        </div>
+        <article id="reader" class="reader" hidden>
+          <header class="reader-header">
+            <div>
+              <h2 id="readerTitle"></h2>
+              <p id="readerPath"></p>
+            </div>
+            <a id="rawLink" class="raw-link" target="_blank" rel="noreferrer">Open</a>
+          </header>
+          <div id="preview" class="preview"></div>
+        </article>
+      </section>
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

@@ -7,13 +7,13 @@
 
 Local semantic search over your files. Index a directory with fully-offline
 embeddings (multilingual, so mixed English/Chinese corpora work) and query it by
-meaning from the CLI — `index`, `query`, `status`. On Linux it can additionally
-mount the index as a FUSE filesystem for agent file operations (undo, audit,
-auto-organization); that piece is an optional build feature and is not required
-for search.
+meaning from the CLI or the local web server — `index`, `query`, `serve`,
+`status`. On Linux it can additionally mount the index as a FUSE filesystem for
+agent file operations (undo, audit, auto-organization); that piece is an
+optional build feature and is not required for search.
 
-> **Platforms:** the CLI (`index`/`query`/`status`) builds and runs on macOS and
-> Linux. FUSE mounting is Linux-only and off by default — enable it with
+> **Platforms:** the CLI and web server (`index`/`query`/`serve`/`status`) build
+> and run on macOS and Linux. FUSE mounting is Linux-only and off by default — enable it with
 > `--features mount` (needs `libfuse`).
 
 ## Features
@@ -22,6 +22,7 @@ for search.
 - **Safety Layer** - Soft delete, audit logging, and undo support via `.safety/`
 - **AI-Powered Management** - Auto-organization, deduplication, and cleanup via `.semantic/`
 - **Semantic Search** - Query files by meaning using vector similarity search
+- **Mobile Web Search** - Serve a private browser UI and JSON API for search/read/preview
 - **Local Embeddings** - Runs entirely offline using the `multilingual-e5-small` model via Candle (multilingual, incl. Chinese)
 - **FUSE Integration** *(Linux, optional `mount` feature)* - Mount indexed directories as a virtual filesystem
 - **Real-time Indexing** - Watch directories for changes and update the index automatically
@@ -35,6 +36,7 @@ for search.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | CLI (index, query, status) | Stable | Core functionality; builds on macOS and Linux |
+| Web/API server | Beta | `ragfs serve`; mobile browser UI plus JSON/raw file endpoints |
 | FUSE mount | Stable | Linux only; optional `mount` build feature |
 | Semantic search | Stable | Vector similarity with LanceDB |
 | Hybrid search | Experimental | Vector + full-text; opt-in via `--hybrid` (FTS wiring being fixed) |
@@ -119,6 +121,30 @@ ragfs --format json query ~/Documents "database connection"
 
 Search is vector-only by default. Hybrid (vector + full-text) is experimental
 and opt-in: `ragfs query --hybrid ~/Documents "..."`.
+
+### Search and read from a browser
+
+```bash
+ragfs serve ~/Documents --host 127.0.0.1 --port 7777
+```
+
+Open <http://127.0.0.1:7777> for the mobile-friendly web UI. The server also
+exposes:
+
+```text
+GET /api/search?q=<text>&limit=<n>
+GET /api/status
+GET /api/files/<relative-path>
+GET /raw/<relative-path>
+```
+
+For a reverse-proxied or NAS deployment, keep `ragfs serve` on localhost or an
+internal network and put authentication in front of it. You can also require a
+bearer token:
+
+```bash
+RAGFS_SERVE_TOKEN="$(openssl rand -base64 32)" ragfs serve ~/Documents
+```
 
 ### Mount as a filesystem (Linux only, requires `--features mount`)
 

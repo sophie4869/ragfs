@@ -16,8 +16,12 @@ use ragfs_core::{EmbedError, Embedder, EmbeddingConfig, EmbeddingOutput, Modalit
 use std::panic;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use std::sync::{Mutex, OnceLock};
 use tokenizers::Tokenizer;
 use tokio::sync::RwLock;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use tracing::warn;
 use tracing::{debug, info};
 
 /// Model identifier on `HuggingFace` Hub.
@@ -94,7 +98,7 @@ fn passage_input(text: &str) -> String {
 
 /// Multilingual e5-small embedder using Candle.
 pub struct CandleEmbedder {
-    /// Device to run inference on (CPU or CUDA)
+    /// Device to run inference on (Metal, CUDA, or CPU)
     device: Device,
     /// Loaded model
     model: Arc<RwLock<Option<BertModel>>>,
@@ -112,8 +116,7 @@ pub struct CandleEmbedder {
 impl CandleEmbedder {
     /// Create a new `CandleEmbedder`.
     pub fn new(cache_dir: PathBuf) -> Self {
-        // Try to use CUDA if available, fallback to CPU
-        let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+        let device = default_device();
         info!("CandleEmbedder using device: {:?}", device);
 
         Self {
@@ -370,6 +373,34 @@ impl CandleEmbedder {
 
         Ok(results)
     }
+}
+
+fn default_device() -> Device {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        match try_new_metal_device(0) {
+            Ok(Ok(device)) => return device,
+            Ok(Err(err)) => warn!("Metal device unavailable, falling back to CPU/CUDA: {err}"),
+            Err(_) => warn!("Metal device initialization panicked, falling back to CPU/CUDA"),
+        }
+    }
+
+    Device::cuda_if_available(0).unwrap_or(Device::Cpu)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn try_new_metal_device(ordinal: usize) -> std::thread::Result<candle_core::Result<Device>> {
+    static METAL_INIT_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    let _guard = METAL_INIT_HOOK_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous_hook = panic::take_hook();
+    panic::set_hook(Box::new(|_| {}));
+    let result = panic::catch_unwind(|| Device::new_metal(ordinal));
+    panic::set_hook(previous_hook);
+    result
 }
 
 #[async_trait]

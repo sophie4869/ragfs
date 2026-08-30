@@ -11,6 +11,7 @@ categories = ["filesystem", "database-implementations"]
 [features]
 default = ["candle", "lancedb"]
 candle = ["ragfs-embed/candle"]
+metal = ["candle", "ragfs-embed/metal"]
 lancedb = ["ragfs-store/lancedb"]
 vision = ["ragfs-extract/vision"]
 
