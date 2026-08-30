@@ -1,5 +1,6 @@
 const state = {
   token: localStorage.getItem("ragfsToken") || "",
+  tokenRequired: false,
   activePath: "",
   activeObjectUrl: "",
 };
@@ -16,6 +17,11 @@ const readerPath = document.querySelector("#readerPath");
 const rawLink = document.querySelector("#rawLink");
 const preview = document.querySelector("#preview");
 
+function syncTokenButton() {
+  tokenButton.hidden = !state.token && !state.tokenRequired;
+  tokenButton.title = state.token ? "Change API token" : "Set API token";
+}
+
 function apiHeaders() {
   const headers = {};
   if (state.token) {
@@ -27,6 +33,8 @@ function apiHeaders() {
 async function requestJson(url) {
   const response = await fetch(url, { headers: apiHeaders() });
   if (response.status === 401) {
+    state.tokenRequired = true;
+    syncTokenButton();
     askForToken();
     throw new Error("Unauthorized");
   }
@@ -48,6 +56,7 @@ function askForToken() {
   } else {
     localStorage.removeItem("ragfsToken");
   }
+  syncTokenButton();
 }
 
 function showNotice(message) {
@@ -70,6 +79,7 @@ function formatBytes(bytes) {
 
 function displayStatus(data) {
   statusLine.textContent = `${data.total_files} files / ${data.total_chunks} chunks`;
+  syncTokenButton();
 }
 
 async function loadStatus() {
@@ -507,6 +517,7 @@ rawLink.addEventListener("click", async (event) => {
   }
 });
 
+syncTokenButton();
 loadStatus();
 
 const initialOpenPath = new URLSearchParams(window.location.search).get("open");
