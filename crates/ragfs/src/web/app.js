@@ -170,10 +170,255 @@ async function fetchRawObjectUrl(path) {
   return state.activeObjectUrl;
 }
 
+function fileExtension(path) {
+  const name = (path || "").split("/").pop() || "";
+  const dot = name.lastIndexOf(".");
+  return dot === -1 ? "" : name.slice(dot + 1).toLowerCase();
+}
+
+function fileText(file) {
+  return file.text || file.chunks.map((chunk) => chunk.content).join("\n\n");
+}
+
+function isMarkdown(file) {
+  const mime = (file.mime_type || "").toLowerCase();
+  const ext = fileExtension(file.relative_path || file.file);
+  return mime.includes("markdown") || ext === "md" || ext === "markdown";
+}
+
+function isPdf(file) {
+  const mime = (file.mime_type || "").toLowerCase();
+  return mime === "application/pdf" || fileExtension(file.relative_path || file.file) === "pdf";
+}
+
+function appendInline(parent, text) {
+  const pattern = /(!?\[[^\]]+\]\([^)]+\)|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[\[[^\]]+\]\])/g;
+  let last = 0;
+  for (const match of text.matchAll(pattern)) {
+    if (match.index > last) {
+      parent.append(document.createTextNode(text.slice(last, match.index)));
+    }
+    parent.append(inlineNode(match[0]));
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) {
+    parent.append(document.createTextNode(text.slice(last)));
+  }
+}
+
+function inlineNode(markup) {
+  if (markup.startsWith("`") && markup.endsWith("`")) {
+    const code = document.createElement("code");
+    code.textContent = markup.slice(1, -1);
+    return code;
+  }
+
+  if (markup.startsWith("**") && markup.endsWith("**")) {
+    const strong = document.createElement("strong");
+    appendInline(strong, markup.slice(2, -2));
+    return strong;
+  }
+
+  if (markup.startsWith("*") && markup.endsWith("*")) {
+    const em = document.createElement("em");
+    appendInline(em, markup.slice(1, -1));
+    return em;
+  }
+
+  const markdownLink = markup.match(/^!?\[([^\]]+)\]\(([^)]+)\)$/);
+  if (markdownLink) {
+    const [, label, href] = markdownLink;
+    if (markup.startsWith("!")) {
+      const img = document.createElement("img");
+      img.alt = label;
+      img.src = href;
+      return img;
+    }
+    const link = document.createElement("a");
+    link.textContent = label;
+    link.href = href;
+    link.target = "_blank";
+    link.rel = "noreferrer";
+    return link;
+  }
+
+  if (markup.startsWith("[[")) {
+    const span = document.createElement("span");
+    span.className = "wikilink";
+    span.textContent = markup.slice(2, -2).split("|").pop();
+    return span;
+  }
+
+  return document.createTextNode(markup);
+}
+
 function renderText(text) {
   const pre = document.createElement("pre");
   pre.textContent = text || "";
   preview.append(pre);
+}
+
+function renderMarkdown(text) {
+  const article = document.createElement("article");
+  article.className = "markdown-body";
+  const lines = (text || "").replace(/\r\n?/g, "\n").split("\n");
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) {
+      i += 1;
+      continue;
+    }
+
+    if (line.trimStart().startsWith("```")) {
+      const language = line.trim().slice(3).trim();
+      const codeLines = [];
+      i += 1;
+      while (i < lines.length && !lines[i].trimStart().startsWith("```")) {
+        codeLines.push(lines[i]);
+        i += 1;
+      }
+      if (i < lines.length) {
+        i += 1;
+      }
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      if (language) {
+        code.dataset.language = language;
+      }
+      code.textContent = codeLines.join("\n");
+      pre.append(code);
+      article.append(pre);
+      continue;
+    }
+
+    if (isTableStart(lines, i)) {
+      const tableLines = [lines[i], lines[i + 1]];
+      i += 2;
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) {
+        tableLines.push(lines[i]);
+        i += 1;
+      }
+      article.append(renderTable(tableLines));
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      const level = Math.min(heading[1].length, 6);
+      const node = document.createElement(`h${level}`);
+      appendInline(node, heading[2].trim());
+      article.append(node);
+      i += 1;
+      continue;
+    }
+
+    if (/^\s*>\s?/.test(line)) {
+      const quote = document.createElement("blockquote");
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+        const p = document.createElement("p");
+        appendInline(p, lines[i].replace(/^\s*>\s?/, ""));
+        quote.append(p);
+        i += 1;
+      }
+      article.append(quote);
+      continue;
+    }
+
+    if (/^\s*([-*+])\s+/.test(line) || /^\s*\d+\.\s+/.test(line)) {
+      const ordered = /^\s*\d+\.\s+/.test(line);
+      const list = document.createElement(ordered ? "ol" : "ul");
+      const itemPattern = ordered ? /^\s*\d+\.\s+/ : /^\s*[-*+]\s+/;
+      while (i < lines.length && itemPattern.test(lines[i])) {
+        const item = document.createElement("li");
+        appendInline(item, lines[i].replace(itemPattern, ""));
+        list.append(item);
+        i += 1;
+      }
+      article.append(list);
+      continue;
+    }
+
+    const paragraphLines = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !isBlockStart(lines, i)
+    ) {
+      paragraphLines.push(lines[i].trim());
+      i += 1;
+    }
+    const paragraph = document.createElement("p");
+    appendInline(paragraph, paragraphLines.join(" "));
+    article.append(paragraph);
+  }
+
+  preview.append(article);
+}
+
+function isBlockStart(lines, index) {
+  const line = lines[index] || "";
+  return (
+    line.trimStart().startsWith("```") ||
+    /^(#{1,6})\s+/.test(line) ||
+    /^\s*>\s?/.test(line) ||
+    /^\s*([-*+])\s+/.test(line) ||
+    /^\s*\d+\.\s+/.test(line) ||
+    isTableStart(lines, index)
+  );
+}
+
+function isTableStart(lines, index) {
+  return (
+    (lines[index] || "").includes("|") &&
+    /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(lines[index + 1] || "")
+  );
+}
+
+function splitTableRow(line) {
+  let cells = line.trim();
+  if (cells.startsWith("|")) {
+    cells = cells.slice(1);
+  }
+  if (cells.endsWith("|")) {
+    cells = cells.slice(0, -1);
+  }
+  return cells.split("|").map((cell) => cell.trim());
+}
+
+function renderTable(lines) {
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  const tbody = document.createElement("tbody");
+  const headerRow = document.createElement("tr");
+
+  splitTableRow(lines[0]).forEach((cell) => {
+    const th = document.createElement("th");
+    appendInline(th, cell);
+    headerRow.append(th);
+  });
+  thead.append(headerRow);
+
+  lines.slice(2).forEach((line) => {
+    const row = document.createElement("tr");
+    splitTableRow(line).forEach((cell) => {
+      const td = document.createElement("td");
+      appendInline(td, cell);
+      row.append(td);
+    });
+    tbody.append(row);
+  });
+
+  table.append(thead, tbody);
+  return table;
+}
+
+async function renderPdf(file) {
+  const iframe = document.createElement("iframe");
+  iframe.title = file.title;
+  iframe.src = await fetchRawObjectUrl(file.relative_path);
+  preview.append(iframe);
 }
 
 async function renderPreview(file) {
@@ -189,11 +434,8 @@ async function renderPreview(file) {
     return;
   }
 
-  if (mime === "application/pdf") {
-    const iframe = document.createElement("iframe");
-    iframe.title = file.title;
-    iframe.src = await fetchRawObjectUrl(path);
-    preview.append(iframe);
+  if (isPdf(file)) {
+    await renderPdf(file);
     return;
   }
 
@@ -205,7 +447,12 @@ async function renderPreview(file) {
     return;
   }
 
-  renderText(file.text || file.chunks.map((chunk) => chunk.content).join("\n\n"));
+  if (isMarkdown(file)) {
+    renderMarkdown(fileText(file));
+    return;
+  }
+
+  renderText(fileText(file));
 }
 
 async function openFile(path) {

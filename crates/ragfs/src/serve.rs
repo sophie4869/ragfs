@@ -307,13 +307,7 @@ async fn raw_handler(
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("failed to read file: {e}")))?;
 
-    let content_type = if record.mime_type.trim().is_empty() {
-        mime_guess::from_path(&record.path)
-            .first_or_octet_stream()
-            .to_string()
-    } else {
-        record.mime_type
-    };
+    let content_type = raw_content_type(&record.mime_type, &record.path);
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
@@ -801,7 +795,8 @@ fn file_response(
     mut chunks: Vec<ragfs_core::Chunk>,
 ) -> FileResponse {
     chunks.sort_by_key(|c| c.chunk_index);
-    let text = if is_text_like(&record.mime_type, &record.path) {
+    let mime_type = effective_mime_type(&record.mime_type, &record.path);
+    let text = if is_text_like(&mime_type, &record.path) {
         Some(
             chunks
                 .iter()
@@ -823,7 +818,7 @@ fn file_response(
         file: record.path.to_string_lossy().to_string(),
         relative_path: relative_path.clone(),
         title: title_for_path(&record.path),
-        mime_type: record.mime_type.clone(),
+        mime_type,
         size_bytes: record.size_bytes,
         modified_at: record.modified_at.to_rfc3339(),
         indexed_at: record.indexed_at.map(|t| t.to_rfc3339()),
@@ -923,6 +918,28 @@ fn kind_for_path(path: &Path) -> String {
     path.extension()
         .and_then(|e| e.to_str())
         .map_or_else(|| "file".to_string(), str::to_ascii_lowercase)
+}
+
+fn effective_mime_type(stored: &str, path: &Path) -> String {
+    let stored = stored.trim();
+    let guessed = mime_guess::from_path(path)
+        .first()
+        .map(|mime| mime.to_string());
+
+    if stored.is_empty() || stored == "application/octet-stream" {
+        guessed.unwrap_or_else(|| "application/octet-stream".to_string())
+    } else {
+        stored.to_string()
+    }
+}
+
+fn raw_content_type(stored: &str, path: &Path) -> String {
+    let mime_type = effective_mime_type(stored, path);
+    if is_text_like(&mime_type, path) && !mime_type.to_ascii_lowercase().contains("charset=") {
+        format!("{mime_type}; charset=utf-8")
+    } else {
+        mime_type
+    }
 }
 
 fn is_text_like(mime_type: &str, path: &Path) -> bool {
@@ -1148,6 +1165,34 @@ mod tests {
         assert_eq!(
             url_path_escape("Incidents/tripod note.md"),
             "Incidents/tripod%20note.md"
+        );
+    }
+
+    #[test]
+    fn test_effective_mime_type_prefers_extension_for_unknown_stored_type() {
+        assert_eq!(
+            effective_mime_type("application/octet-stream", Path::new("note.md")),
+            "text/markdown"
+        );
+        assert_eq!(
+            effective_mime_type("", Path::new("memo.pdf")),
+            "application/pdf"
+        );
+        assert_eq!(
+            effective_mime_type("text/plain", Path::new("note.md")),
+            "text/plain"
+        );
+    }
+
+    #[test]
+    fn test_raw_content_type_adds_utf8_charset_for_text() {
+        assert_eq!(
+            raw_content_type("text/markdown", Path::new("note.md")),
+            "text/markdown; charset=utf-8"
+        );
+        assert_eq!(
+            raw_content_type("", Path::new("memo.pdf")),
+            "application/pdf"
         );
     }
 
