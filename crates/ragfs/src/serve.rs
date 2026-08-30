@@ -11,18 +11,22 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use ragfs_core::{FileRecord, SearchResult, StoreStats, VectorStore};
+use ragfs_core::{Chunk, FileRecord, SearchResult, StoreStats, VectorStore};
 use ragfs_embed::EmbedderPool;
 use ragfs_query::QueryExecutor;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 /// Max results a single request may ask for.
 const MAX_LIMIT: usize = 100;
+
+/// Max vector candidates fetched before HTTP-layer reranking.
+const MAX_CANDIDATE_LIMIT: usize = 100;
 
 /// Length (chars) of the content snippet returned per result.
 const SNIPPET_LEN: usize = 240;
@@ -30,6 +34,7 @@ const SNIPPET_LEN: usize = 240;
 const INDEX_HTML: &str = include_str!("web/index.html");
 const APP_CSS: &str = include_str!("web/app.css");
 const APP_JS: &str = include_str!("web/app.js");
+const MATCH_REASON_KEY: &str = "match_reason";
 
 /// Shared server state: the model and index, loaded once.
 struct AppState {
@@ -40,6 +45,7 @@ struct AppState {
     index_path: String,
     root_path: PathBuf,
     token: Option<String>,
+    query_lock: Mutex<()>,
 }
 
 /// Run the local query server until the process is stopped.
@@ -67,6 +73,7 @@ pub async fn run(
         index_path,
         root_path,
         token,
+        query_lock: Mutex::new(()),
     });
 
     // Localhost-only server; a permissive CORS policy lets the Obsidian plugin
@@ -153,18 +160,28 @@ async fn query_handler(
         ));
     }
     let limit = parse_limit(params.get("limit").map(String::as_str), state.default_limit);
+    let candidate_limit = candidate_limit(limit);
+    let profile = QueryProfile::new(query);
+    let search_queries = semantic_queries(query, &profile);
 
-    let executor = QueryExecutor::new(
-        state.store.clone(),
-        state.embedder.document_embedder(),
+    let vector_results = {
+        // Candle's Metal backend can abort on concurrent command encoders. Keep
+        // embedding-backed searches single-flight; the rest of the HTTP server
+        // remains concurrent.
+        let _guard = state.query_lock.lock().await;
+        execute_semantic_queries(&state, &search_queries, candidate_limit).await?
+    };
+    let lexical_results =
+        lexical_candidates(&profile, &state.store, &state.root_path, candidate_limit)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let results = rerank_results(
+        &profile,
+        vector_results,
+        lexical_results,
+        &state.root_path,
         limit,
-        false, // vector-only; hybrid is opt-in and still being fixed
     );
-
-    let results = executor
-        .execute(query)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(to_response_with_root(
         query,
@@ -184,6 +201,8 @@ pub struct ResultItem {
     pub kind: String,
     pub score: f32,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines: Option<String>,
 }
@@ -314,6 +333,10 @@ pub fn parse_limit(raw: Option<&str>, default: usize) -> usize {
         .clamp(1, MAX_LIMIT)
 }
 
+fn candidate_limit(limit: usize) -> usize {
+    (limit.saturating_mul(5)).clamp(limit, MAX_CANDIDATE_LIMIT)
+}
+
 /// Build the HTTP response body from raw search results, truncating snippets.
 #[cfg(test)]
 pub fn to_response(query: &str, results: &[SearchResult], snippet_len: usize) -> QueryResponse {
@@ -345,11 +368,419 @@ fn result_item(r: &SearchResult, snippet_len: usize, root: Option<&Path>) -> Res
         kind: kind_for_path(&r.file_path),
         score: r.score,
         content: truncate(&r.content, snippet_len),
+        reason: r.metadata.get("match_reason").cloned(),
         lines: r
             .line_range
             .as_ref()
             .map(|l| format!("{}:{}", l.start, l.end)),
     }
+}
+
+async fn execute_semantic_queries(
+    state: &AppState,
+    queries: &[String],
+    limit: usize,
+) -> Result<Vec<SearchResult>, (StatusCode, String)> {
+    let mut results = Vec::new();
+    for (index, query) in queries.iter().enumerate() {
+        let executor = QueryExecutor::new(
+            state.store.clone(),
+            state.embedder.document_embedder(),
+            limit,
+            false, // vector-only; hybrid is opt-in and still being fixed
+        );
+        let reason = semantic_reason(index, query);
+        let weight = if index == 0 { 1.0 } else { 0.96 };
+
+        let mut query_results = executor
+            .execute(query)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        for result in &mut query_results {
+            result.score *= weight;
+            result
+                .metadata
+                .insert(MATCH_REASON_KEY.to_string(), reason.clone());
+        }
+        results.extend(query_results);
+    }
+    Ok(results)
+}
+
+fn semantic_reason(index: usize, query: &str) -> String {
+    if index == 0 {
+        "semantic".to_string()
+    } else if query.split_whitespace().count() > 4 {
+        "semantic: keywords".to_string()
+    } else {
+        format!("semantic: {}", truncate(query, 64))
+    }
+}
+
+async fn lexical_candidates(
+    profile: &QueryProfile,
+    store: &Arc<dyn VectorStore>,
+    root: &Path,
+    limit: usize,
+) -> Result<Vec<SearchResult>, ragfs_core::StoreError> {
+    if profile.terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut scored = store
+        .get_all_chunks()
+        .await?
+        .into_iter()
+        .filter_map(|chunk| {
+            let signal = lexical_signal(profile, &chunk.file_path, &chunk.content, root);
+            (signal.score > 0.0).then(|| {
+                (
+                    signal.score,
+                    search_result_from_chunk(chunk, signal.score, signal.reason()),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    Ok(scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, result)| result)
+        .collect())
+}
+
+fn search_result_from_chunk(chunk: Chunk, score: f32, reason: String) -> SearchResult {
+    let mut metadata = chunk.metadata.extra;
+    metadata.insert(MATCH_REASON_KEY.to_string(), reason);
+
+    SearchResult {
+        chunk_id: chunk.id,
+        file_path: chunk.file_path,
+        content: chunk.content,
+        score,
+        byte_range: chunk.byte_range,
+        line_range: chunk.line_range,
+        metadata,
+    }
+}
+
+fn rerank_results(
+    profile: &QueryProfile,
+    vector_results: Vec<SearchResult>,
+    lexical_results: Vec<SearchResult>,
+    root: &Path,
+    limit: usize,
+) -> Vec<SearchResult> {
+    let mut by_file = HashMap::<PathBuf, SearchResult>::new();
+
+    for mut result in vector_results {
+        let signal = lexical_signal(profile, &result.file_path, &result.content, root);
+        result.score += signal.score.min(0.34);
+        result.metadata.insert(
+            MATCH_REASON_KEY.to_string(),
+            combined_reason(&result, &signal),
+        );
+        insert_best_by_file(&mut by_file, result);
+    }
+
+    for mut result in lexical_results {
+        // Lexical-only results need a floor high enough to beat weak semantic
+        // neighbors, while still being driven by generic path/title/content
+        // overlap rather than hard-coded domain aliases.
+        let signal = lexical_signal(profile, &result.file_path, &result.content, root);
+        let lexical = result.score.max(signal.score);
+        result.score = 0.55 + lexical.min(0.42);
+        if !result.metadata.contains_key(MATCH_REASON_KEY) {
+            result
+                .metadata
+                .insert(MATCH_REASON_KEY.to_string(), signal.reason());
+        }
+        insert_best_by_file(&mut by_file, result);
+    }
+
+    let mut results = by_file.into_values().collect::<Vec<_>>();
+    results.sort_by(|a, b| b.score.total_cmp(&a.score));
+    results.truncate(limit);
+    results
+}
+
+fn insert_best_by_file(results: &mut HashMap<PathBuf, SearchResult>, result: SearchResult) {
+    match results.get(&result.file_path) {
+        Some(existing) if existing.score >= result.score => {}
+        _ => {
+            results.insert(result.file_path.clone(), result);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct QueryProfile {
+    terms: Vec<String>,
+    phrases: Vec<String>,
+}
+
+impl QueryProfile {
+    fn new(query: &str) -> Self {
+        let terms = query_terms(query);
+        let phrases = query_phrases(&terms);
+        Self { terms, phrases }
+    }
+}
+
+#[derive(Debug, Default)]
+struct LexicalSignal {
+    score: f32,
+    matched_terms: usize,
+    reasons: Vec<String>,
+    seen_reasons: HashSet<String>,
+}
+
+impl LexicalSignal {
+    fn add(&mut self, amount: f32, reason: impl Into<String>) {
+        self.score += amount;
+        let reason = reason.into();
+        if self.seen_reasons.insert(reason.clone()) && self.reasons.len() < 4 {
+            self.reasons.push(reason);
+        }
+    }
+
+    fn reason(&self) -> String {
+        if self.reasons.is_empty() {
+            "lexical".to_string()
+        } else {
+            self.reasons.join(", ")
+        }
+    }
+}
+
+fn combined_reason(result: &SearchResult, signal: &LexicalSignal) -> String {
+    let semantic = result
+        .metadata
+        .get(MATCH_REASON_KEY)
+        .map_or("semantic", String::as_str);
+    if signal.score > 0.0 {
+        format!("{semantic}, {}", signal.reason())
+    } else {
+        semantic.to_string()
+    }
+}
+
+fn lexical_signal(
+    profile: &QueryProfile,
+    path: &Path,
+    content: &str,
+    root: &Path,
+) -> LexicalSignal {
+    let title = normalize_search_text(&title_for_path(path));
+    let rel_path = relative_path(path, root).unwrap_or_else(|| path.to_string_lossy().to_string());
+    let path_text = normalize_search_text(&rel_path);
+    let content_text = normalize_search_text(content);
+    let title_tokens = text_tokens(&title);
+    let path_tokens = text_tokens(&path_text);
+    let content_tokens = text_tokens(&content_text);
+    let mut signal = LexicalSignal::default();
+
+    for phrase in profile.phrases.iter().take(8) {
+        if title.contains(phrase) {
+            signal.add(0.24, format!("title phrase: {phrase}"));
+        }
+        if path_text.contains(phrase) {
+            signal.add(0.16, format!("path phrase: {phrase}"));
+        }
+        if content_text.contains(phrase) {
+            signal.add(0.10, format!("content phrase: {phrase}"));
+        }
+    }
+
+    for term in &profile.terms {
+        let mut term_score: f32 = 0.0;
+        if text_matches_term(&title, &title_tokens, term) {
+            term_score += 0.18;
+            signal.add(0.0, format!("title: {term}"));
+        }
+        if text_matches_term(&path_text, &path_tokens, term) {
+            term_score += 0.13;
+            signal.add(0.0, format!("path: {term}"));
+        }
+        if text_matches_term(&content_text, &content_tokens, term) {
+            term_score += 0.05;
+            signal.add(0.0, format!("content: {term}"));
+        }
+        if term_score > 0.0 {
+            signal.matched_terms += 1;
+            signal.score += term_score.min(0.20);
+        }
+    }
+
+    if signal.matched_terms >= 2 {
+        signal.score += 0.06;
+    }
+    if signal.matched_terms >= 4 {
+        signal.score += 0.04;
+    }
+    signal.score = signal.score.min(0.70);
+    signal
+}
+
+fn semantic_queries(query: &str, profile: &QueryProfile) -> Vec<String> {
+    let mut queries = Vec::new();
+    let mut seen = HashSet::new();
+    push_query(&mut queries, &mut seen, query);
+
+    if profile.terms.len() >= 2 {
+        push_query(&mut queries, &mut seen, &profile.terms.join(" "));
+    }
+    for phrase in profile.phrases.iter().take(3) {
+        push_query(&mut queries, &mut seen, phrase);
+    }
+
+    queries.truncate(5);
+    queries
+}
+
+fn push_query(queries: &mut Vec<String>, seen: &mut HashSet<String>, query: &str) {
+    let query = query.trim();
+    if !query.is_empty() && seen.insert(query.to_string()) {
+        queries.push(query.to_string());
+    }
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    let stopwords = stopwords();
+    let mut seen = HashSet::new();
+    let mut terms = Vec::new();
+
+    for raw in raw_terms(query) {
+        for variant in term_variants(&raw) {
+            let term = normalize_search_text(&variant);
+            if term.chars().count() >= 2
+                && !stopwords.contains(term.as_str())
+                && seen.insert(term.clone())
+            {
+                terms.push(term);
+            }
+        }
+    }
+
+    terms
+}
+
+fn raw_terms(query: &str) -> Vec<String> {
+    let normalized = normalize_search_text(query);
+    let mut terms = Vec::new();
+    for part in normalized.split_whitespace() {
+        if part.chars().any(is_cjk) && part.chars().count() > 4 {
+            terms.extend(cjk_ngrams(part, 2));
+            terms.extend(cjk_ngrams(part, 3));
+        } else {
+            terms.push(part.to_string());
+        }
+    }
+    terms
+}
+
+fn query_phrases(terms: &[String]) -> Vec<String> {
+    let mut phrases = Vec::new();
+    let mut seen = HashSet::new();
+    for width in 2..=3 {
+        for window in terms.windows(width) {
+            if window.iter().all(|term| !term.chars().any(is_cjk)) {
+                let phrase = window.join(" ");
+                if seen.insert(phrase.clone()) {
+                    phrases.push(phrase);
+                }
+            }
+        }
+    }
+    phrases
+}
+
+fn term_variants(term: &str) -> Vec<String> {
+    let mut variants = vec![term.to_string()];
+    if term.chars().any(is_cjk) {
+        return variants;
+    }
+
+    if let Some(stripped) = term.strip_suffix('s')
+        && stripped.len() >= 3
+    {
+        variants.push(stripped.to_string());
+    }
+    if let Some(stripped) = term.strip_suffix("ies")
+        && stripped.len() >= 2
+    {
+        variants.push(format!("{stripped}y"));
+    } else if let Some(stripped) = term.strip_suffix('y')
+        && stripped.len() >= 2
+    {
+        variants.push(format!("{stripped}ies"));
+    }
+    if let Some(stripped) = term.strip_suffix("ing")
+        && stripped.len() >= 4
+    {
+        variants.push(stripped.to_string());
+    }
+    if let Some(stripped) = term.strip_suffix("ed")
+        && stripped.len() >= 4
+    {
+        variants.push(stripped.to_string());
+    }
+    variants
+}
+
+fn cjk_ngrams(input: &str, width: usize) -> Vec<String> {
+    let chars = input.chars().collect::<Vec<_>>();
+    chars
+        .windows(width)
+        .map(|window| window.iter().collect::<String>())
+        .collect()
+}
+
+fn text_tokens(text: &str) -> Vec<&str> {
+    text.split_whitespace().collect()
+}
+
+fn text_matches_term(text: &str, tokens: &[&str], term: &str) -> bool {
+    if term.chars().any(is_cjk) {
+        return text.contains(term);
+    }
+    tokens.iter().any(|token| {
+        *token == term
+            || (term.len() >= 4 && token.starts_with(term))
+            || (token.len() >= 5 && term.starts_with(*token))
+    })
+}
+
+fn normalize_search_text(input: &str) -> String {
+    input
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || is_cjk(c) {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_cjk(c: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&c)
+}
+
+fn stopwords() -> HashSet<&'static str> {
+    [
+        "a", "an", "and", "are", "did", "do", "for", "here", "how", "i", "in", "is", "it", "my",
+        "note", "notes", "of", "or", "save", "saved", "the", "to", "what", "where", "which",
+        "your", "关于", "保存", "哪些",
+    ]
+    .into_iter()
+    .collect()
 }
 
 fn status_response(state: &AppState, stats: StoreStats) -> StatusResponse {
@@ -577,6 +1008,13 @@ mod tests {
     }
 
     #[test]
+    fn test_candidate_limit_expands_small_requests() {
+        assert_eq!(candidate_limit(3), 15);
+        assert_eq!(candidate_limit(25), MAX_CANDIDATE_LIMIT);
+        assert_eq!(candidate_limit(MAX_LIMIT), MAX_CANDIDATE_LIMIT);
+    }
+
+    #[test]
     fn test_to_response_maps_fields() {
         let results = vec![
             result("/vault/a.md", 0.82, "hello world", Some((3, 9))),
@@ -608,6 +1046,90 @@ mod tests {
             resp.results[0].relative_path.as_deref(),
             Some("folder/a.md")
         );
+    }
+
+    #[test]
+    fn test_query_terms_use_generic_variants_not_domain_aliases() {
+        let terms = query_terms("where did I save astronomy or night sky photo notes");
+        assert!(terms.contains(&"astronomy".to_string()));
+        assert!(terms.contains(&"sky".to_string()));
+        assert!(terms.contains(&"skies".to_string()));
+        assert!(terms.contains(&"photo".to_string()));
+        assert!(!terms.contains(&"where".to_string()));
+        assert!(!terms.contains(&"stargazing".to_string()));
+        assert!(!terms.contains(&"milky".to_string()));
+    }
+
+    #[test]
+    fn test_query_terms_extract_cjk_ngrams_from_long_queries() {
+        let terms = query_terms("关于房东纠纷我保存了哪些证据");
+        assert!(terms.contains(&"房东".to_string()));
+        assert!(terms.contains(&"纠纷".to_string()));
+        assert!(terms.contains(&"证据".to_string()));
+        assert!(!terms.contains(&"哪些".to_string()));
+    }
+
+    #[test]
+    fn test_semantic_queries_add_compact_query_for_long_questions() {
+        let profile = QueryProfile::new("where did I save astronomy or night sky photo notes");
+        let queries = semantic_queries(
+            "where did I save astronomy or night sky photo notes",
+            &profile,
+        );
+
+        assert_eq!(
+            queries[0],
+            "where did I save astronomy or night sky photo notes"
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.contains("astronomy") && query.contains("photo"))
+        );
+    }
+
+    #[test]
+    fn test_rerank_adds_path_and_content_lexical_candidates() {
+        let root = Path::new("/vault");
+        let profile = QueryProfile::new("where did I save astronomy or night sky photo notes");
+        let vector_results = vec![result(
+            "/vault/Incidents/boris.pdf",
+            0.64,
+            "answer to the code review team and contact people ops",
+            None,
+        )];
+        let lexical_results = vec![result(
+            "/vault/Photography/Milky way.md",
+            0.0,
+            "places to go stargazing in Europe with clear skies",
+            None,
+        )];
+
+        let reranked = rerank_results(&profile, vector_results, lexical_results, root, 2);
+
+        assert_eq!(
+            reranked[0].file_path,
+            PathBuf::from("/vault/Photography/Milky way.md")
+        );
+        assert!(reranked[0].metadata["match_reason"].contains("path: photo"));
+        assert!(reranked[0].metadata["match_reason"].contains("content: skies"));
+    }
+
+    #[test]
+    fn test_rerank_deduplicates_by_file() {
+        let root = Path::new("/vault");
+        let profile = QueryProfile::new("query");
+        let vector_results = vec![
+            result("/vault/a.md", 0.70, "first chunk", None),
+            result("/vault/a.md", 0.80, "better chunk", None),
+            result("/vault/b.md", 0.60, "other", None),
+        ];
+
+        let reranked = rerank_results(&profile, vector_results, Vec::new(), root, 10);
+
+        assert_eq!(reranked.len(), 2);
+        assert_eq!(reranked[0].file_path, PathBuf::from("/vault/a.md"));
+        assert_eq!(reranked[0].content, "better chunk");
     }
 
     #[test]

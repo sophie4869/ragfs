@@ -108,8 +108,12 @@ function resultButton(item) {
   snippet.className = "snippet";
   snippet.textContent = item.content || "";
 
+  const reason = document.createElement("div");
+  reason.className = "reason";
+  reason.textContent = item.reason || "semantic";
+
   row.append(title, score);
-  button.append(row, path, snippet);
+  button.append(row, path, reason, snippet);
   button.addEventListener("click", () => openFile(item.relative_path));
   li.append(button);
   return li;

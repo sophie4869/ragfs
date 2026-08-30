@@ -209,12 +209,18 @@ h1 {
 }
 
 .result-path,
+.reason,
 .snippet {
   margin-top: 6px;
   color: var(--muted);
   font-size: 14px;
   line-height: 1.35;
   overflow-wrap: anywhere;
+}
+
+.reason {
+  color: var(--accent-strong);
+  font-size: 12px;
 }
 
 .snippet {
