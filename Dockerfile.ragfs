@@ -1,4 +1,8 @@
+# syntax=docker/dockerfile:1.7
+
 FROM rust:1-bookworm AS builder
+
+ARG TARGETPLATFORM
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -12,7 +16,11 @@ RUN apt-get update \
 WORKDIR /app
 COPY . .
 
-RUN cargo build --release -p ragfs
+RUN --mount=type=cache,id=ragfs-cargo-registry-${TARGETPLATFORM},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=ragfs-cargo-git-${TARGETPLATFORM},target=/usr/local/cargo/git \
+    --mount=type=cache,id=ragfs-target-${TARGETPLATFORM},target=/app/target \
+    cargo build --release -p ragfs \
+    && cp /app/target/release/ragfs /usr/local/bin/ragfs
 
 FROM debian:bookworm-slim AS runtime
 
@@ -22,7 +30,7 @@ RUN apt-get update \
         libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/ragfs /usr/local/bin/ragfs
+COPY --from=builder /usr/local/bin/ragfs /usr/local/bin/ragfs
 
 ENV RUST_LOG=info
 ENTRYPOINT ["ragfs"]

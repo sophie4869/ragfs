@@ -16,6 +16,10 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: docker-ragfs-${{ github.ref }}-${{ inputs.platform }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build and push RAGFS image
