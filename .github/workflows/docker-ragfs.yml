@@ -2,6 +2,15 @@ name: Docker RAGFS
 
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Docker platform to build
+        required: true
+        default: linux/amd64
+        type: choice
+        options:
+          - linux/amd64
+          - linux/arm64
 
 permissions:
   contents: read
@@ -13,8 +22,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
 
@@ -36,7 +43,7 @@ jobs:
         with:
           context: .
           file: Dockerfile.ragfs
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ inputs.platform }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
