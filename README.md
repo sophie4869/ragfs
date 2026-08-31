@@ -156,6 +156,15 @@ bearer token:
 RAGFS_SERVE_TOKEN="$(openssl rand -base64 32)" ragfs serve ~/Documents
 ```
 
+If the index was built on another machine, pass the original indexed root as
+`path` and the local filesystem root as `--serve-root`. This lets a NAS serve a
+Mac-built index while reading files from the NAS copy:
+
+```bash
+ragfs serve /Users/sophiebi/ObsidianVault/03_Resources \
+  --serve-root /volume1/ragfs-vault/03_Resources
+```
+
 ### Mount as a filesystem (Linux only, requires `--features mount`)
 
 ```bash

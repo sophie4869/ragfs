@@ -158,6 +158,10 @@ enum Commands {
         /// Path to the indexed directory
         path: PathBuf,
 
+        /// Root directory to read files from when serving an index built elsewhere
+        #[arg(long)]
+        serve_root: Option<PathBuf>,
+
         /// Port to listen on
         #[arg(short, long, default_value = "7777")]
         port: u16,
@@ -751,16 +755,36 @@ async fn main() -> Result<()> {
 
         Commands::Serve {
             path,
+            serve_root,
             port,
             host,
             limit,
             token,
             token_env,
         } => {
-            if !path.exists() {
+            let serve_root = match serve_root {
+                Some(root) => {
+                    if !root.exists() {
+                        anyhow::bail!("Serve root does not exist: {}", root.display());
+                    }
+                    Some(root.canonicalize()?)
+                }
+                None => None,
+            };
+
+            if serve_root.is_none() && !path.exists() {
                 anyhow::bail!("Directory does not exist: {}", path.display());
             }
-            let path = path.canonicalize()?;
+            let path = if path.exists() {
+                path.canonicalize()?
+            } else if path.is_absolute() {
+                path
+            } else {
+                anyhow::bail!(
+                    "Indexed path must exist or be absolute when --serve-root is used: {}",
+                    path.display()
+                );
+            };
 
             let db_path = get_db_path(&path)?;
             if !db_path.exists() {
@@ -781,6 +805,7 @@ async fn main() -> Result<()> {
                 embedder,
                 model,
                 path.to_string_lossy().to_string(),
+                serve_root.map(|p| p.to_string_lossy().to_string()),
                 &host,
                 port,
                 limit,

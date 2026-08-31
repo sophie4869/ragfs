@@ -43,7 +43,9 @@ struct AppState {
     default_limit: usize,
     model: String,
     index_path: String,
-    root_path: PathBuf,
+    serve_root_path: String,
+    indexed_root_path: PathBuf,
+    serve_root_pathbuf: PathBuf,
     token: Option<String>,
     query_lock: Mutex<()>,
     aliases: SearchAliases,
@@ -58,15 +60,29 @@ pub async fn run(
     embedder: Arc<EmbedderPool>,
     model: String,
     index_path: String,
+    serve_root_path: Option<String>,
     host: &str,
     port: u16,
     default_limit: usize,
     token: Option<String>,
 ) -> anyhow::Result<()> {
-    let root_path = PathBuf::from(&index_path)
+    let indexed_root_path = PathBuf::from(&index_path);
+    if !indexed_root_path.is_absolute() {
+        anyhow::bail!("index path must be absolute: {index_path}");
+    }
+    let serve_root_pathbuf = serve_root_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| indexed_root_path.clone())
         .canonicalize()
-        .with_context(|| format!("Failed to canonicalize index path {index_path}"))?;
-    let aliases = SearchAliases::load(&root_path);
+        .with_context(|| {
+            format!(
+                "Failed to canonicalize serve root {}",
+                serve_root_path.as_deref().unwrap_or(&index_path)
+            )
+        })?;
+    let serve_root_path = serve_root_pathbuf.to_string_lossy().to_string();
+    let aliases = SearchAliases::load(&serve_root_pathbuf);
     if !aliases.is_empty() {
         info!("loaded {} search aliases", aliases.len());
     }
@@ -76,7 +92,9 @@ pub async fn run(
         default_limit,
         model,
         index_path,
-        root_path,
+        serve_root_path,
+        indexed_root_path,
+        serve_root_pathbuf,
         token,
         query_lock: Mutex::new(()),
         aliases,
@@ -120,6 +138,7 @@ struct HealthResponse {
     status: &'static str,
     model: String,
     index_path: String,
+    serve_root_path: String,
 }
 
 async fn index_handler() -> Html<&'static str> {
@@ -148,6 +167,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthRespon
         status: "ok",
         model: state.model.clone(),
         index_path: state.index_path.clone(),
+        serve_root_path: state.serve_root_path.clone(),
     })
 }
 
@@ -177,15 +197,19 @@ async fn query_handler(
         let _guard = state.query_lock.lock().await;
         execute_semantic_queries(&state, &search_queries, candidate_limit).await?
     };
-    let lexical_results =
-        lexical_candidates(&profile, &state.store, &state.root_path, candidate_limit)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let lexical_results = lexical_candidates(
+        &profile,
+        &state.store,
+        &state.indexed_root_path,
+        candidate_limit,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let results = rerank_results(
         &profile,
         vector_results,
         lexical_results,
-        &state.root_path,
+        &state.indexed_root_path,
         limit,
     );
 
@@ -193,7 +217,8 @@ async fn query_handler(
         query,
         &results,
         SNIPPET_LEN,
-        Some(&state.root_path),
+        Some(&state.indexed_root_path),
+        Some(&state.serve_root_pathbuf),
     )))
 }
 
@@ -225,6 +250,7 @@ struct StatusResponse {
     status: &'static str,
     model: String,
     index_path: String,
+    serve_root_path: String,
     total_files: u64,
     total_chunks: u64,
     index_size_bytes: u64,
@@ -274,10 +300,11 @@ async fn file_handler(
 ) -> Result<Json<FileResponse>, (StatusCode, String)> {
     require_auth(&state, &headers)?;
 
-    let absolute = canonical_file_path(&state.root_path, &path).await?;
+    let indexed_absolute = resolve_file_path(&state.indexed_root_path, &path)?;
+    let served_absolute = canonical_file_path(&state.serve_root_pathbuf, &path).await?;
     let record = state
         .store
-        .get_file(&absolute)
+        .get_file(&indexed_absolute)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let Some(record) = record else {
@@ -285,11 +312,17 @@ async fn file_handler(
     };
     let chunks = state
         .store
-        .get_chunks_for_file(&absolute)
+        .get_chunks_for_file(&indexed_absolute)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(file_response(&state.root_path, &record, chunks)))
+    Ok(Json(file_response(
+        &state.indexed_root_path,
+        &state.serve_root_pathbuf,
+        &record,
+        chunks,
+        &served_absolute,
+    )))
 }
 
 async fn raw_handler(
@@ -300,10 +333,11 @@ async fn raw_handler(
 ) -> Result<Response, (StatusCode, String)> {
     require_auth(&state, &headers)?;
 
-    let absolute = canonical_file_path(&state.root_path, &path).await?;
+    let indexed_absolute = resolve_file_path(&state.indexed_root_path, &path)?;
+    let served_absolute = canonical_file_path(&state.serve_root_pathbuf, &path).await?;
     let record = state
         .store
-        .get_file(&absolute)
+        .get_file(&indexed_absolute)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let Some(record) = record else {
@@ -311,16 +345,16 @@ async fn raw_handler(
     };
 
     if browser_wants_html(&headers) && is_markdown_path(&record.path) && !wants_raw(&params) {
-        let relative_path = relative_path(&record.path, &state.root_path)
+        let relative_path = relative_path(&record.path, &state.indexed_root_path)
             .unwrap_or_else(|| record.path.to_string_lossy().to_string());
         return redirect_response(&format!("/?open={}", url_query_escape(&relative_path)));
     }
 
-    let bytes = tokio::fs::read(&record.path)
+    let bytes = tokio::fs::read(&served_absolute)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("failed to read file: {e}")))?;
 
-    let content_type = raw_content_type(&record.mime_type, &record.path);
+    let content_type = raw_content_type(&record.mime_type, &served_absolute);
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
@@ -347,7 +381,7 @@ fn candidate_limit(limit: usize) -> usize {
 /// Build the HTTP response body from raw search results, truncating snippets.
 #[cfg(test)]
 pub fn to_response(query: &str, results: &[SearchResult], snippet_len: usize) -> QueryResponse {
-    to_response_with_root(query, results, snippet_len, None)
+    to_response_with_root(query, results, snippet_len, None, None)
 }
 
 /// Build the HTTP response body from raw search results, truncating snippets.
@@ -355,21 +389,31 @@ pub fn to_response_with_root(
     query: &str,
     results: &[SearchResult],
     snippet_len: usize,
-    root: Option<&Path>,
+    indexed_root: Option<&Path>,
+    serve_root: Option<&Path>,
 ) -> QueryResponse {
     QueryResponse {
         query: query.to_string(),
         results: results
             .iter()
-            .map(|r| result_item(r, snippet_len, root))
+            .map(|r| result_item(r, snippet_len, indexed_root, serve_root))
             .collect(),
     }
 }
 
-fn result_item(r: &SearchResult, snippet_len: usize, root: Option<&Path>) -> ResultItem {
-    let relative_path = root.and_then(|root| relative_path(&r.file_path, root));
+fn result_item(
+    r: &SearchResult,
+    snippet_len: usize,
+    indexed_root: Option<&Path>,
+    serve_root: Option<&Path>,
+) -> ResultItem {
+    let relative_path = indexed_root.and_then(|root| relative_path(&r.file_path, root));
+    let display_path = relative_path
+        .as_deref()
+        .and_then(|path| serve_root.map(|root| root.join(path)))
+        .unwrap_or_else(|| r.file_path.clone());
     ResultItem {
-        file: r.file_path.to_string_lossy().to_string(),
+        file: display_path.to_string_lossy().to_string(),
         relative_path,
         title: title_for_path(&r.file_path),
         kind: kind_for_path(&r.file_path),
@@ -898,6 +942,7 @@ fn status_response(state: &AppState, stats: StoreStats) -> StatusResponse {
         status: "ok",
         model: state.model.clone(),
         index_path: state.index_path.clone(),
+        serve_root_path: state.serve_root_path.clone(),
         total_files: stats.total_files,
         total_chunks: stats.total_chunks,
         index_size_bytes: stats.index_size_bytes,
@@ -906,13 +951,15 @@ fn status_response(state: &AppState, stats: StoreStats) -> StatusResponse {
 }
 
 fn file_response(
-    root: &Path,
+    indexed_root: &Path,
+    serve_root: &Path,
     record: &FileRecord,
     mut chunks: Vec<ragfs_core::Chunk>,
+    served_path: &Path,
 ) -> FileResponse {
     chunks.sort_by_key(|c| c.chunk_index);
-    let mime_type = effective_mime_type(&record.mime_type, &record.path);
-    let text = if is_text_like(&mime_type, &record.path) {
+    let mime_type = effective_mime_type(&record.mime_type, served_path);
+    let text = if is_text_like(&mime_type, served_path) {
         Some(
             chunks
                 .iter()
@@ -923,17 +970,18 @@ fn file_response(
     } else {
         None
     };
-    let relative_path = relative_path(&record.path, root).unwrap_or_else(|| {
+    let relative_path = relative_path(&record.path, indexed_root).unwrap_or_else(|| {
         record
             .path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().to_string())
     });
+    let display_path = serve_root.join(&relative_path);
 
     FileResponse {
-        file: record.path.to_string_lossy().to_string(),
+        file: display_path.to_string_lossy().to_string(),
         relative_path: relative_path.clone(),
-        title: title_for_path(&record.path),
+        title: title_for_path(served_path),
         mime_type,
         size_bytes: record.size_bytes,
         modified_at: record.modified_at.to_rfc3339(),
@@ -1222,11 +1270,29 @@ mod tests {
     #[test]
     fn test_to_response_adds_relative_path_when_root_matches() {
         let results = vec![result("/vault/folder/a.md", 0.82, "hello world", None)];
-        let resp = to_response_with_root("q", &results, 100, Some(Path::new("/vault")));
+        let resp = to_response_with_root("q", &results, 100, Some(Path::new("/vault")), None);
         assert_eq!(
             resp.results[0].relative_path.as_deref(),
             Some("folder/a.md")
         );
+    }
+
+    #[test]
+    fn test_to_response_remaps_display_path_to_serve_root() {
+        let results = vec![result("/mac/vault/folder/a.md", 0.82, "hello world", None)];
+        let resp = to_response_with_root(
+            "q",
+            &results,
+            100,
+            Some(Path::new("/mac/vault")),
+            Some(Path::new("/volume1/vault")),
+        );
+
+        assert_eq!(
+            resp.results[0].relative_path.as_deref(),
+            Some("folder/a.md")
+        );
+        assert_eq!(resp.results[0].file, "/volume1/vault/folder/a.md");
     }
 
     #[test]
