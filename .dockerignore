@@ -1,8 +1,10 @@
 # Rust build artifacts (very large)
 /target/
+crates/ragfs-python/target/
 
 # Git
 .git/
+.github/
 .gitignore
 
 # LanceDB data
@@ -19,15 +21,21 @@
 .env
 .env.local
 
-# Python (if any)
+# Node
+node_modules/
+
+# Python
 .venv/
 venv/
+crates/ragfs-python/.venv/
 __pycache__/
+crates/ragfs-python/__pycache__/
 *.py[cod]
 *.egg-info/
 dist/
 build/
 .pytest_cache/
+crates/ragfs-python/.pytest_cache/
 .coverage
 coverage/
 *.so
@@ -38,6 +46,7 @@ Thumbs.db
 
 # Logs
 *.log
+**/*.log
 
 # Documentation (not needed in container)
 *.md

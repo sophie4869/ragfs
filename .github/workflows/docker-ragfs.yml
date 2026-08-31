@@ -2,15 +2,6 @@ name: Docker RAGFS
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - obsidian-integration
-    paths:
-      - Dockerfile.ragfs
-      - .github/workflows/docker-ragfs.yml
-      - Cargo.lock
-      - Cargo.toml
-      - crates/**
 
 permissions:
   contents: read
