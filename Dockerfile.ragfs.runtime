@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1.7
+
+FROM ubuntu:24.04 AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3t64 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY dist/ragfs /usr/local/bin/ragfs
+
+ENV RUST_LOG=info
+ENTRYPOINT ["ragfs"]

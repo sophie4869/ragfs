@@ -33,6 +33,8 @@ crates/ragfs-python/__pycache__/
 *.py[cod]
 *.egg-info/
 dist/
+!dist/
+!dist/ragfs
 build/
 .pytest_cache/
 crates/ragfs-python/.pytest_cache/
