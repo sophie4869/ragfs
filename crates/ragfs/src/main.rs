@@ -162,6 +162,14 @@ enum Commands {
         #[arg(long)]
         serve_root: Option<PathBuf>,
 
+        /// Explicit index location, instead of deriving it from the path hash
+        /// under the app data dir. Point this at the index directory (the one
+        /// containing `index.lance`, or the `index.lance` dataset itself). Use
+        /// it for Docker/NAS deployments where the index is mounted at a known
+        /// path rather than built in-container.
+        #[arg(long)]
+        index_dir: Option<PathBuf>,
+
         /// Port to listen on
         #[arg(short, long, default_value = "7777")]
         port: u16,
@@ -311,8 +319,26 @@ async fn create_components(
     Arc<ChunkerRegistry>,
     Arc<EmbedderPool>,
 )> {
+    create_components_at(source, None).await
+}
+
+/// Like [`create_components`], but opens the vector store at an explicit
+/// `db_override` path when given (used by `ragfs serve --index-dir`), instead of
+/// deriving it from the source path hash.
+async fn create_components_at(
+    source: PathBuf,
+    db_override: Option<PathBuf>,
+) -> Result<(
+    Arc<LanceStore>,
+    Arc<ExtractorRegistry>,
+    Arc<ChunkerRegistry>,
+    Arc<EmbedderPool>,
+)> {
     // Create store
-    let db_path = get_db_path(&source)?;
+    let db_path = match db_override {
+        Some(p) => p,
+        None => get_db_path(&source)?,
+    };
     let store = Arc::new(LanceStore::new(db_path, EMBEDDING_DIM));
 
     // Create extractor registry
@@ -756,6 +782,7 @@ async fn main() -> Result<()> {
         Commands::Serve {
             path,
             serve_root,
+            index_dir,
             port,
             host,
             limit,
@@ -786,16 +813,26 @@ async fn main() -> Result<()> {
                 );
             };
 
-            let db_path = get_db_path(&path)?;
+            // Resolve where the index lives: an explicit --index-dir (pointing
+            // at the index directory or the index.lance dataset), otherwise the
+            // hash-derived path under the app data dir.
+            let db_path = match &index_dir {
+                Some(dir) => {
+                    let nested = dir.join("index.lance");
+                    if nested.exists() { nested } else { dir.clone() }
+                }
+                None => get_db_path(&path)?,
+            };
             if !db_path.exists() {
                 anyhow::bail!(
-                    "Index not found for {}. Run 'ragfs index {}' first.",
-                    path.display(),
-                    path.display()
+                    "Index not found at {}. Build it with 'ragfs index' (and mount \
+                     it, or pass --index-dir) first.",
+                    db_path.display()
                 );
             }
 
-            let (store, _extractors, _chunkers, embedder) = create_components(path.clone()).await?;
+            let (store, _extractors, _chunkers, embedder) =
+                create_components_at(path.clone(), Some(db_path)).await?;
             store.init().await.context("Failed to initialize store")?;
             let model = embedder.model_name().to_string();
             let token = token.or_else(|| std::env::var(token_env).ok());
