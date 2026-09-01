@@ -56,7 +56,7 @@ mod serve;
 use config::{Config, data_dir};
 
 /// Embedding dimension for the multilingual-e5-small model.
-const EMBEDDING_DIM: usize = 384;
+pub(crate) const EMBEDDING_DIM: usize = 384;
 
 #[derive(Parser)]
 #[command(name = "ragfs")]
@@ -832,7 +832,7 @@ async fn main() -> Result<()> {
             }
 
             let (store, _extractors, _chunkers, embedder) =
-                create_components_at(path.clone(), Some(db_path)).await?;
+                create_components_at(path.clone(), Some(db_path.clone())).await?;
             store.init().await.context("Failed to initialize store")?;
             let model = embedder.model_name().to_string();
             let token = token.or_else(|| std::env::var(token_env).ok());
@@ -842,6 +842,7 @@ async fn main() -> Result<()> {
                 embedder,
                 model,
                 path.to_string_lossy().to_string(),
+                db_path,
                 serve_root.map(|p| p.to_string_lossy().to_string()),
                 &host,
                 port,

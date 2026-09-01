@@ -9,16 +9,17 @@ use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use ragfs_core::{Chunk, FileRecord, SearchResult, StoreStats, VectorStore};
 use ragfs_embed::EmbedderPool;
 use ragfs_query::QueryExecutor;
+use ragfs_store::LanceStore;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
@@ -38,17 +39,19 @@ const MATCH_REASON_KEY: &str = "match_reason";
 
 /// Shared server state: the model and index, loaded once.
 struct AppState {
-    store: Arc<dyn VectorStore>,
+    store: RwLock<Arc<dyn VectorStore>>,
     embedder: Arc<EmbedderPool>,
     default_limit: usize,
     model: String,
     index_path: String,
+    db_path: PathBuf,
     serve_root_path: String,
     indexed_root_path: PathBuf,
     serve_root_pathbuf: PathBuf,
     token: Option<String>,
     query_lock: Mutex<()>,
-    aliases: SearchAliases,
+    reload_lock: Mutex<()>,
+    aliases: RwLock<SearchAliases>,
 }
 
 /// Run the local query server until the process is stopped.
@@ -60,6 +63,7 @@ pub async fn run(
     embedder: Arc<EmbedderPool>,
     model: String,
     index_path: String,
+    db_path: PathBuf,
     serve_root_path: Option<String>,
     host: &str,
     port: u16,
@@ -72,8 +76,7 @@ pub async fn run(
     }
     let serve_root_pathbuf = serve_root_path
         .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| indexed_root_path.clone())
+        .map_or_else(|| indexed_root_path.clone(), PathBuf::from)
         .canonicalize()
         .with_context(|| {
             format!(
@@ -87,17 +90,19 @@ pub async fn run(
         info!("loaded {} search aliases", aliases.len());
     }
     let state = Arc::new(AppState {
-        store,
+        store: RwLock::new(store),
         embedder,
         default_limit,
         model,
         index_path,
+        db_path,
         serve_root_path,
         indexed_root_path,
         serve_root_pathbuf,
         token,
         query_lock: Mutex::new(()),
-        aliases,
+        reload_lock: Mutex::new(()),
+        aliases: RwLock::new(aliases),
     });
 
     // Localhost-only server; a permissive CORS policy lets the Obsidian plugin
@@ -112,6 +117,8 @@ pub async fn run(
         .route("/query", get(query_handler))
         .route("/api/search", get(query_handler))
         .route("/api/status", get(status_handler))
+        .route("/api/reload", post(reload_handler))
+        .route("/reload", post(reload_handler))
         .route("/api/files/{*path}", get(file_handler))
         .route("/raw/{*path}", get(raw_handler))
         .layer(cors)
@@ -124,6 +131,7 @@ pub async fn run(
     info!("ragfs serve listening on http://{addr}");
     info!("  GET /query?q=<text>&limit=<n>");
     info!("  GET /api/search?q=<text>&limit=<n>");
+    info!("  POST /api/reload");
     info!("  GET /api/files/<relative-path>");
     info!("  GET /raw/<relative-path>");
 
@@ -187,24 +195,24 @@ async fn query_handler(
     }
     let limit = parse_limit(params.get("limit").map(String::as_str), state.default_limit);
     let candidate_limit = candidate_limit(limit);
-    let profile = QueryProfile::new(query, &state.aliases);
+    let profile = {
+        let aliases = state.aliases.read().await;
+        QueryProfile::new(query, &aliases)
+    };
     let search_queries = semantic_queries(query, &profile);
+    let store = current_store(&state).await;
 
     let vector_results = {
         // Candle's Metal backend can abort on concurrent command encoders. Keep
         // embedding-backed searches single-flight; the rest of the HTTP server
         // remains concurrent.
         let _guard = state.query_lock.lock().await;
-        execute_semantic_queries(&state, &search_queries, candidate_limit).await?
+        execute_semantic_queries(&state, &store, &search_queries, candidate_limit).await?
     };
-    let lexical_results = lexical_candidates(
-        &profile,
-        &state.store,
-        &state.indexed_root_path,
-        candidate_limit,
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let lexical_results =
+        lexical_candidates(&profile, &store, &state.indexed_root_path, candidate_limit)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let results = rerank_results(
         &profile,
         vector_results,
@@ -246,6 +254,19 @@ pub struct QueryResponse {
 }
 
 #[derive(Serialize)]
+struct ReloadResponse {
+    status: &'static str,
+    model: String,
+    index_path: String,
+    db_path: String,
+    total_files: u64,
+    total_chunks: u64,
+    index_size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_updated: Option<String>,
+}
+
+#[derive(Serialize)]
 struct StatusResponse {
     status: &'static str,
     model: String,
@@ -284,8 +305,8 @@ async fn status_handler(
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
     require_auth(&state, &headers)?;
 
-    let stats = state
-        .store
+    let store = current_store(&state).await;
+    let stats = store
         .stats()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -302,16 +323,15 @@ async fn file_handler(
 
     let indexed_absolute = resolve_file_path(&state.indexed_root_path, &path)?;
     let served_absolute = canonical_file_path(&state.serve_root_pathbuf, &path).await?;
-    let record = state
-        .store
+    let store = current_store(&state).await;
+    let record = store
         .get_file(&indexed_absolute)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let Some(record) = record else {
         return Err((StatusCode::NOT_FOUND, "file is not indexed".to_string()));
     };
-    let chunks = state
-        .store
+    let chunks = store
         .get_chunks_for_file(&indexed_absolute)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -335,8 +355,8 @@ async fn raw_handler(
 
     let indexed_absolute = resolve_file_path(&state.indexed_root_path, &path)?;
     let served_absolute = canonical_file_path(&state.serve_root_pathbuf, &path).await?;
-    let record = state
-        .store
+    let store = current_store(&state).await;
+    let record = store
         .get_file(&indexed_absolute)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -362,6 +382,51 @@ async fn raw_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(response)
+}
+
+async fn reload_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<ReloadResponse>, (StatusCode, String)> {
+    require_auth(&state, &headers)?;
+
+    let _guard = state.reload_lock.lock().await;
+    let store = open_store(&state.db_path).await?;
+    let stats = store
+        .stats()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    {
+        let mut current = state.store.write().await;
+        *current = store;
+    }
+    {
+        let mut aliases = state.aliases.write().await;
+        *aliases = SearchAliases::load(&state.serve_root_pathbuf);
+    }
+
+    info!("reloaded index from {}", state.db_path.display());
+    Ok(Json(reload_response(&state, stats)))
+}
+
+async fn current_store(state: &AppState) -> Arc<dyn VectorStore> {
+    state.store.read().await.clone()
+}
+
+async fn open_store(db_path: &Path) -> Result<Arc<dyn VectorStore>, (StatusCode, String)> {
+    if !db_path.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("index not found at {}", db_path.display()),
+        ));
+    }
+
+    let store = Arc::new(LanceStore::new(db_path.to_path_buf(), crate::EMBEDDING_DIM));
+    store
+        .init()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(store)
 }
 
 /// Resolve the effective result limit from a raw query-string value.
@@ -429,13 +494,14 @@ fn result_item(
 
 async fn execute_semantic_queries(
     state: &AppState,
+    store: &Arc<dyn VectorStore>,
     queries: &[String],
     limit: usize,
 ) -> Result<Vec<SearchResult>, (StatusCode, String)> {
     let mut results = Vec::new();
     for (index, query) in queries.iter().enumerate() {
         let executor = QueryExecutor::new(
-            state.store.clone(),
+            store.clone(),
             state.embedder.document_embedder(),
             limit,
             false, // vector-only; hybrid is opt-in and still being fixed
@@ -943,6 +1009,19 @@ fn status_response(state: &AppState, stats: StoreStats) -> StatusResponse {
         model: state.model.clone(),
         index_path: state.index_path.clone(),
         serve_root_path: state.serve_root_path.clone(),
+        total_files: stats.total_files,
+        total_chunks: stats.total_chunks,
+        index_size_bytes: stats.index_size_bytes,
+        last_updated: stats.last_updated.map(|t| t.to_rfc3339()),
+    }
+}
+
+fn reload_response(state: &AppState, stats: StoreStats) -> ReloadResponse {
+    ReloadResponse {
+        status: "ok",
+        model: state.model.clone(),
+        index_path: state.index_path.clone(),
+        db_path: state.db_path.to_string_lossy().to_string(),
         total_files: stats.total_files,
         total_chunks: stats.total_chunks,
         index_size_bytes: stats.index_size_bytes,
