@@ -52,6 +52,7 @@ use tracing_subscriber::FmtSubscriber;
 
 mod config;
 mod serve;
+mod sync;
 
 use config::{Config, data_dir};
 
@@ -189,6 +190,60 @@ enum Commands {
         /// Environment variable to read the bearer token from
         #[arg(long, default_value = "RAGFS_SERVE_TOKEN")]
         token_env: String,
+    },
+
+    /// Sync a local index to a remote host and reload a running server
+    SyncIndex {
+        /// Path to the indexed directory
+        path: PathBuf,
+
+        /// Explicit local index location, instead of deriving it from the path hash
+        #[arg(long)]
+        index_dir: Option<PathBuf>,
+
+        /// SSH target for the NAS/remote host, e.g. `nas` or `user@host`
+        #[arg(long)]
+        remote: String,
+
+        /// Remote staging directory rsync writes to, e.g. `/volume2/docker/ragfs/index-next`
+        #[arg(long)]
+        remote_stage: String,
+
+        /// Remote symlink that serve reads, e.g. `/volume2/docker/ragfs/index`
+        #[arg(long)]
+        remote_current: String,
+
+        /// URL for POST reload, usually `http://127.0.0.1:7777/api/reload`
+        #[arg(long)]
+        reload_url: String,
+
+        /// Run the reload curl over SSH on the remote host
+        #[arg(long)]
+        reload_on_remote: bool,
+
+        /// Bearer token for reload (prefer `RAGFS_SERVE_TOKEN`)
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Environment variable to read the reload token from
+        #[arg(long, default_value = "RAGFS_SERVE_TOKEN")]
+        token_env: String,
+
+        /// Keep syncing when the local index changes
+        #[arg(short, long)]
+        watch: bool,
+
+        /// Watch polling interval in seconds
+        #[arg(long, default_value = "300")]
+        interval_secs: u64,
+
+        /// Require the local index to be unchanged for this many seconds before syncing
+        #[arg(long, default_value = "30")]
+        settle_secs: u64,
+
+        /// Print the rsync/ssh/curl actions without executing them
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Manage configuration
@@ -850,6 +905,58 @@ async fn main() -> Result<()> {
                 token,
             )
             .await?;
+        }
+
+        Commands::SyncIndex {
+            path,
+            index_dir,
+            remote,
+            remote_stage,
+            remote_current,
+            reload_url,
+            reload_on_remote,
+            token,
+            token_env,
+            watch,
+            interval_secs,
+            settle_secs,
+            dry_run,
+        } => {
+            let path = if path.exists() {
+                path.canonicalize()?
+            } else if path.is_absolute() {
+                path
+            } else {
+                anyhow::bail!("Indexed path must exist or be absolute: {}", path.display());
+            };
+            let db_path = match &index_dir {
+                Some(dir) => {
+                    let nested = dir.join("index.lance");
+                    if nested.exists() { nested } else { dir.clone() }
+                }
+                None => get_db_path(&path)?,
+            };
+            let source_bundle = sync::index_bundle_dir(&db_path)?;
+            let token = token.or_else(|| std::env::var(token_env).ok());
+
+            let config = sync::SyncConfig {
+                source_bundle,
+                remote,
+                remote_stage,
+                remote_current,
+                reload_url,
+                reload_on_remote,
+                token,
+                interval: std::time::Duration::from_secs(interval_secs),
+                settle: std::time::Duration::from_secs(settle_secs),
+                dry_run,
+            };
+
+            if watch {
+                sync::watch(config).await?;
+            } else {
+                sync::sync_once(&config).await?;
+            }
         }
 
         Commands::Config { action } => {
