@@ -11,6 +11,7 @@ use futures::TryStreamExt;
 use lancedb::index::Index;
 use lancedb::index::scalar::{FtsIndexBuilder, FullTextSearchQuery};
 use lancedb::query::{ExecutableQuery, QueryBase, QueryExecutionOptions};
+use lancedb::table::{CompactionOptions, OptimizeAction};
 use lancedb::{Connection, Table, connect};
 use ragfs_core::{
     Chunk, ChunkMetadata, ContentType, FileRecord, FileStatus, SearchQuery, SearchResult,
@@ -178,6 +179,39 @@ impl LanceStore {
         }
 
         Ok(table_lock.as_ref().unwrap().clone())
+    }
+
+    /// Compact the on-disk dataset: merge the many small fragments left by
+    /// per-file commits into a few, then prune all superseded versions to
+    /// reclaim space. Indexing a large tree can leave a multi-GB, 60k-file
+    /// dataset; after compaction it is a handful of files.
+    ///
+    /// Prune uses `older_than = 0` with `delete_unverified = true`, which is
+    /// safe only when no other writer is touching the index (the intended use
+    /// is a one-shot compaction of a finished index).
+    pub async fn compact(&self) -> Result<(), StoreError> {
+        for table in [
+            self.get_chunks_table().await?,
+            self.get_files_table().await?,
+        ] {
+            table
+                .optimize(OptimizeAction::Compact {
+                    options: CompactionOptions::default(),
+                    remap_options: None,
+                })
+                .await
+                .map_err(|e| StoreError::Optimize(format!("Compaction failed: {e}")))?;
+
+            table
+                .optimize(OptimizeAction::Prune {
+                    older_than: Some(chrono::Duration::zero()),
+                    delete_unverified: Some(true),
+                    error_if_tagged_old_versions: Some(false),
+                })
+                .await
+                .map_err(|e| StoreError::Optimize(format!("Prune failed: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Convert chunks to Arrow `RecordBatch`.

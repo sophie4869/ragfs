@@ -246,6 +246,16 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Compact an index: merge fragments and prune old versions to reclaim space
+    Compact {
+        /// Path whose index should be compacted
+        path: PathBuf,
+
+        /// Explicit index location (same meaning as `serve --index-dir`)
+        #[arg(long)]
+        index_dir: Option<PathBuf>,
+    },
+
     /// Manage configuration
     Config {
         #[command(subcommand)]
@@ -697,6 +707,15 @@ async fn main() -> Result<()> {
                     "Indexing complete: {} files, {} chunks",
                     stats.total_files, stats.total_chunks
                 );
+
+                // Merge the fragments left by per-file commits and prune old
+                // versions, so the on-disk index stays small (and rsync-able).
+                info!("Compacting index...");
+                if let Err(e) = store.compact().await {
+                    tracing::warn!("Index compaction failed (index still usable): {e}");
+                } else {
+                    info!("Compaction complete.");
+                }
             }
 
             drop(progress_handle);
@@ -957,6 +976,32 @@ async fn main() -> Result<()> {
             } else {
                 sync::sync_once(&config).await?;
             }
+        }
+
+        Commands::Compact { path, index_dir } => {
+            let db_path = match &index_dir {
+                Some(dir) => {
+                    let nested = dir.join("index.lance");
+                    if nested.exists() { nested } else { dir.clone() }
+                }
+                None => {
+                    let p = if path.exists() {
+                        path.canonicalize()?
+                    } else {
+                        path.clone()
+                    };
+                    get_db_path(&p)?
+                }
+            };
+            if !db_path.exists() {
+                anyhow::bail!("Index not found at {}", db_path.display());
+            }
+
+            let store = LanceStore::new(db_path.clone(), EMBEDDING_DIM);
+            store.init().await.context("Failed to initialize store")?;
+            info!("Compacting index at {}...", db_path.display());
+            store.compact().await.context("Compaction failed")?;
+            info!("Compaction complete.");
         }
 
         Commands::Config { action } => {
