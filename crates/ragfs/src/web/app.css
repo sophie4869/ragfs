@@ -349,8 +349,29 @@ h1 {
   overflow-wrap: anywhere;
 }
 
-.result-path {
+.result-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin-top: 5px;
+  min-width: 0;
+}
+
+.file-kind {
+  flex: 0 0 auto;
+  color: var(--accent-strong);
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--accent-tint) 64%, transparent);
+  border-radius: 6px;
+  padding: 1px 5px;
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 1.35;
+  letter-spacing: 0;
+}
+
+.result-path {
+  min-width: 0;
   color: var(--ink-faint);
   font-size: 12px;
   letter-spacing: 0.01em;

@@ -110,6 +110,13 @@ function resultButton(item) {
   score.className = "score";
   score.textContent = Number(item.score).toFixed(2);
 
+  const meta = document.createElement("div");
+  meta.className = "result-meta";
+
+  const kind = document.createElement("span");
+  kind.className = "file-kind";
+  kind.textContent = fileKindLabel(item);
+
   const path = document.createElement("div");
   path.className = "result-path";
   path.textContent = item.relative_path || item.file;
@@ -123,7 +130,8 @@ function resultButton(item) {
   reason.textContent = item.reason || "semantic";
 
   row.append(title, score);
-  button.append(row, path, reason, snippet);
+  meta.append(kind, path);
+  button.append(row, meta, reason, snippet);
   button.addEventListener("click", () => openFile(item.relative_path));
   li.append(button);
   return li;
@@ -189,6 +197,18 @@ function fileExtension(path) {
   const name = (path || "").split("/").pop() || "";
   const dot = name.lastIndexOf(".");
   return dot === -1 ? "" : name.slice(dot + 1).toLowerCase();
+}
+
+function fileKindLabel(item) {
+  const raw =
+    (item.kind || fileExtension(item.relative_path || item.file) || "file")
+      .toString()
+      .trim()
+      .toLowerCase();
+  if (raw === "markdown") {
+    return "MD";
+  }
+  return raw.slice(0, 8).toUpperCase();
 }
 
 function fileText(file) {
