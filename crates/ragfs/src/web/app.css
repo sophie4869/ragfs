@@ -600,6 +600,24 @@ h1 {
 .preview iframe {
   height: calc(100dvh - 140px);
 }
+.pdf-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  align-self: flex-start;
+  margin-bottom: 14px;
+  padding: 11px 20px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-ink, #fff);
+  font-weight: 600;
+  font-size: 0.95rem;
+  text-decoration: none;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.15);
+}
+.pdf-open:hover {
+  filter: brightness(1.05);
+}
 
 .notice {
   margin: 16px 24px;

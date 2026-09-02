@@ -430,9 +430,23 @@ function renderTable(lines) {
 }
 
 async function renderPdf(file) {
+  const objectUrl = await fetchRawObjectUrl(file.relative_path);
+  // A tokened blob can't be opened by a plain /raw link (a new tab can't send
+  // the auth header, so it 401s), and mobile Safari won't render a blob PDF in
+  // an iframe. Lead with a tap-to-open link to the blob — it opens in the
+  // native PDF viewer on both mobile and desktop — then keep the iframe as a
+  // best-effort inline preview for browsers that do render it.
+  const open = document.createElement("a");
+  open.className = "pdf-open";
+  open.href = objectUrl;
+  open.target = "_blank";
+  open.rel = "noreferrer";
+  open.textContent = "Open PDF ↗";
+  preview.append(open);
+
   const iframe = document.createElement("iframe");
   iframe.title = file.title;
-  iframe.src = await fetchRawObjectUrl(file.relative_path);
+  iframe.src = objectUrl;
   preview.append(iframe);
 }
 
@@ -488,6 +502,12 @@ async function openFile(path) {
     readerPath.textContent = `${file.relative_path} · ${formatBytes(file.size_bytes)}`;
     rawLink.href = rawBrowserUrl(file);
     await renderPreview(file);
+    // For files fetched as a tokened blob (pdf/image/video), point "Raw" at the
+    // blob too — a bare /raw link 401s under token auth since the new tab can't
+    // send the header.
+    if (state.activeObjectUrl) {
+      rawLink.href = state.activeObjectUrl;
+    }
   } catch (error) {
     readerTitle.textContent = "Unable to open";
     renderText(error.message);
