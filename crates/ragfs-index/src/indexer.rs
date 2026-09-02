@@ -631,7 +631,16 @@ fn scan_directory(
         };
 
         let mut queued = 0;
-        for entry in entries.flatten() {
+        for entry in entries {
+            // Don't silently drop an unreadable entry: a transient error on a
+            // single DirEntry would otherwise skip a whole subtree unnoticed.
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("Skipping unreadable entry in {:?}: {}", dir, e);
+                    continue;
+                }
+            };
             let path = entry.path();
 
             if matcher.is_excluded(&path) {

@@ -229,6 +229,11 @@ enum Commands {
         #[arg(long, default_value = "RAGFS_SERVE_TOKEN")]
         token_env: String,
 
+        /// Remote rsync binary path, passed as `--rsync-path` (Synology needs
+        /// `/usr/bin/rsync`, else rsync fails with "unexpected end of file")
+        #[arg(long)]
+        rsync_path: Option<String>,
+
         /// Keep syncing when the local index changes
         #[arg(short, long)]
         watch: bool,
@@ -936,6 +941,7 @@ async fn main() -> Result<()> {
             reload_on_remote,
             token,
             token_env,
+            rsync_path,
             watch,
             interval_secs,
             settle_secs,
@@ -966,6 +972,7 @@ async fn main() -> Result<()> {
                 reload_url,
                 reload_on_remote,
                 token,
+                rsync_path,
                 interval: std::time::Duration::from_secs(interval_secs),
                 settle: std::time::Duration::from_secs(settle_secs),
                 dry_run,

@@ -20,6 +20,7 @@ pub struct SyncConfig {
     pub reload_url: String,
     pub reload_on_remote: bool,
     pub token: Option<String>,
+    pub rsync_path: Option<String>,
     pub interval: Duration,
     pub settle: Duration,
     pub dry_run: bool,
@@ -154,7 +155,12 @@ fn modified_ns(time: SystemTime) -> u128 {
 }
 
 fn run_rsync(config: &SyncConfig) -> Result<()> {
-    let args = rsync_args(&config.source_bundle, &config.remote, &config.remote_stage);
+    let args = rsync_args(
+        &config.source_bundle,
+        &config.remote,
+        &config.remote_stage,
+        config.rsync_path.as_deref(),
+    );
     run_command("rsync", &args, config.dry_run)
 }
 
@@ -208,14 +214,26 @@ fn run_command(program: &str, args: &[String], dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn rsync_args(source_bundle: &Path, remote: &str, remote_stage: &str) -> Vec<String> {
-    vec![
+fn rsync_args(
+    source_bundle: &Path,
+    remote: &str,
+    remote_stage: &str,
+    rsync_path: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
         "-a".to_string(),
         "--delete".to_string(),
         "--delay-updates".to_string(),
-        ensure_trailing_slash(&source_bundle.to_string_lossy()),
-        format!("{remote}:{}", ensure_trailing_slash(remote_stage)),
-    ]
+    ];
+    // On Synology (and other NAS), the remote login shell often lacks rsync on
+    // its PATH, which surfaces as "unexpected end of file". Point rsync at the
+    // remote binary explicitly.
+    if let Some(path) = rsync_path {
+        args.push(format!("--rsync-path={path}"));
+    }
+    args.push(ensure_trailing_slash(&source_bundle.to_string_lossy()));
+    args.push(format!("{remote}:{}", ensure_trailing_slash(remote_stage)));
+    args
 }
 
 fn curl_reload_args(reload_url: &str, token: Option<&str>) -> Vec<String> {
@@ -292,6 +310,7 @@ mod tests {
             Path::new("/Users/sophie/Library/Application Support/ragfs/indices/abc"),
             "nas",
             "/volume2/docker/ragfs/index-next",
+            None,
         );
         assert_eq!(
             args,
@@ -303,6 +322,19 @@ mod tests {
                 "nas:/volume2/docker/ragfs/index-next/",
             ]
         );
+    }
+
+    #[test]
+    fn rsync_args_includes_rsync_path_when_set() {
+        let args = rsync_args(
+            Path::new("/idx"),
+            "nas",
+            "/remote/stage",
+            Some("/usr/bin/rsync"),
+        );
+        assert!(args.contains(&"--rsync-path=/usr/bin/rsync".to_string()));
+        // still the source/dest at the end
+        assert_eq!(args.last().unwrap(), "nas:/remote/stage/");
     }
 
     #[test]
