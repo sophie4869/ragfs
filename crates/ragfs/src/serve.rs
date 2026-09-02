@@ -35,6 +35,13 @@ const SNIPPET_LEN: usize = 240;
 const INDEX_HTML: &str = include_str!("web/index.html");
 const APP_CSS: &str = include_str!("web/app.css");
 const APP_JS: &str = include_str!("web/app.js");
+const MANIFEST: &str = include_str!("web/manifest.webmanifest");
+const SERVICE_WORKER: &str = include_str!("web/sw.js");
+const ICON_192: &[u8] = include_bytes!("web/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("web/icon-512.png");
+const ICON_MASKABLE_512: &[u8] = include_bytes!("web/icon-maskable-512.png");
+const APPLE_TOUCH_ICON: &[u8] = include_bytes!("web/apple-touch-icon.png");
+const FAVICON_32: &[u8] = include_bytes!("web/favicon-32.png");
 const MATCH_REASON_KEY: &str = "match_reason";
 
 /// Shared server state: the model and index, loaded once.
@@ -113,6 +120,14 @@ pub async fn run(
         .route("/", get(index_handler))
         .route("/app.css", get(css_handler))
         .route("/app.js", get(js_handler))
+        .route("/manifest.webmanifest", get(manifest_handler))
+        .route("/sw.js", get(service_worker_handler))
+        .route("/icon-192.png", get(icon_192_handler))
+        .route("/icon-512.png", get(icon_512_handler))
+        .route("/icon-maskable-512.png", get(icon_maskable_handler))
+        .route("/apple-touch-icon.png", get(apple_touch_icon_handler))
+        .route("/favicon-32.png", get(favicon_handler))
+        .route("/favicon.ico", get(favicon_handler))
         .route("/health", get(health_handler))
         .route("/query", get(query_handler))
         .route("/api/search", get(query_handler))
@@ -168,6 +183,68 @@ async fn js_handler() -> impl IntoResponse {
         )],
         APP_JS,
     )
+}
+
+async fn manifest_handler() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/manifest+json"),
+        )],
+        MANIFEST,
+    )
+}
+
+async fn service_worker_handler() -> impl IntoResponse {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/javascript"),
+            ),
+            // Allow the worker to control the whole origin, and avoid a stale
+            // worker being pinned by the HTTP cache.
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-cache"),
+            ),
+        ],
+        SERVICE_WORKER,
+    )
+}
+
+/// Serve a static PNG asset with a long-lived cache header.
+fn png_response(bytes: &'static [u8]) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("image/png")),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=604800"),
+            ),
+        ],
+        bytes,
+    )
+}
+
+async fn icon_192_handler() -> impl IntoResponse {
+    png_response(ICON_192)
+}
+
+async fn icon_512_handler() -> impl IntoResponse {
+    png_response(ICON_512)
+}
+
+async fn icon_maskable_handler() -> impl IntoResponse {
+    png_response(ICON_MASKABLE_512)
+}
+
+async fn apple_touch_icon_handler() -> impl IntoResponse {
+    png_response(APPLE_TOUCH_ICON)
+}
+
+async fn favicon_handler() -> impl IntoResponse {
+    png_response(FAVICON_32)
 }
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
