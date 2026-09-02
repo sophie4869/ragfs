@@ -1,10 +1,10 @@
 // RAGFS service worker — offline app shell + safe API passthrough.
 // Bump CACHE when any precached asset changes so clients pick up new files.
-const CACHE = "ragfs-v1";
+const CACHE = "ragfs-v2";
 const SHELL = [
   "/",
-  "/app.css",
-  "/app.js",
+  "/app.css?v=2",
+  "/app.js?v=2",
   "/manifest.webmanifest",
   "/icon-192.png",
   "/icon-512.png",

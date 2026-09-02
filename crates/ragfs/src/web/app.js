@@ -113,10 +113,6 @@ function resultButton(item) {
   const meta = document.createElement("div");
   meta.className = "result-meta";
 
-  const kind = document.createElement("span");
-  kind.className = "file-kind";
-  kind.textContent = fileKindLabel(item);
-
   const path = document.createElement("div");
   path.className = "result-path";
   path.textContent = item.relative_path || item.file;
@@ -130,7 +126,14 @@ function resultButton(item) {
   reason.textContent = item.reason || "semantic";
 
   row.append(title, score);
-  meta.append(kind, path);
+  const kindLabel = fileKindLabel(item);
+  if (kindLabel) {
+    const kind = document.createElement("span");
+    kind.className = "file-kind";
+    kind.textContent = kindLabel;
+    meta.append(kind);
+  }
+  meta.append(path);
   button.append(row, meta, reason, snippet);
   button.addEventListener("click", () => openFile(item.relative_path));
   li.append(button);
@@ -205,10 +208,7 @@ function fileKindLabel(item) {
       .toString()
       .trim()
       .toLowerCase();
-  if (raw === "markdown") {
-    return "MD";
-  }
-  return raw.slice(0, 8).toUpperCase();
+  return raw === "pdf" ? "PDF" : "";
 }
 
 function fileText(file) {
