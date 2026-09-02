@@ -222,6 +222,15 @@ fn rsync_args(
 ) -> Vec<String> {
     let mut args = vec![
         "-a".to_string(),
+        // Synology shared folders use ACLs that reject chmod/chown from a
+        // non-root rsync, which otherwise fails the whole transfer with
+        // exit 23 ("failed to set permissions"). Drop permission/ownership
+        // preservation (and dir times) — the index is content, not a backup,
+        // so remote perms don't matter.
+        "--no-perms".to_string(),
+        "--no-owner".to_string(),
+        "--no-group".to_string(),
+        "--omit-dir-times".to_string(),
         "--delete".to_string(),
         "--delay-updates".to_string(),
     ];
@@ -316,6 +325,10 @@ mod tests {
             args,
             vec![
                 "-a",
+                "--no-perms",
+                "--no-owner",
+                "--no-group",
+                "--omit-dir-times",
                 "--delete",
                 "--delay-updates",
                 "/Users/sophie/Library/Application Support/ragfs/indices/abc/",
