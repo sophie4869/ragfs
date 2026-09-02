@@ -569,6 +569,41 @@ fn is_low_content_chunk(content: &str) -> bool {
     content.chars().filter(|c| c.is_alphanumeric()).count() < 3
 }
 
+/// Whether a file is a binary document worth indexing by filename when its
+/// content can't be extracted (scanned/image-only PDFs, office docs). Media
+/// files (images/audio/video) are excluded so attachment filenames don't flood
+/// results; plain-text formats (txt/md/csv) are excluded too, since for them an
+/// empty extraction means the file really is empty.
+fn is_nameable_document(path: &Path) -> bool {
+    const DOC_EXTS: &[&str] = &[
+        "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "odt", "ods", "odp", "rtf", "epub",
+        "pages", "numbers",
+    ];
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| DOC_EXTS.contains(&e.as_str()))
+}
+
+/// A single chunk carrying just the file's name, used to make a document
+/// findable by filename when its content is unavailable. The filename/path
+/// context is added by [`embedding_text_for_chunk`] at embed time.
+fn name_only_chunk(path: &Path) -> ChunkOutput {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    ChunkOutput {
+        content: stem,
+        byte_range: 0..0,
+        line_range: None,
+        parent_index: None,
+        depth: 0,
+        metadata: ragfs_core::ChunkOutputMetadata::default(),
+    }
+}
+
 fn embedding_path_context(path: &Path) -> String {
     let title = path
         .file_stem()
@@ -702,32 +737,47 @@ async fn process_file(
         .first_or_text_plain()
         .to_string();
 
-    // Extract content
-    let content = extractors
-        .extract(path, &mime_type)
-        .await
-        .map_err(Error::Extraction)?;
+    // Extract content. A document that yields no text (scanned/image-only PDF)
+    // or fails extraction is still indexed by its filename/path so it can be
+    // found by name — but only for document types, not media (images/audio),
+    // which would otherwise flood results with attachment filenames.
+    let nameable = is_nameable_document(path);
+    let extracted = extractors.extract(path, &mime_type).await;
 
-    if content.text.is_empty() {
-        debug!("Empty content for {:?}, skipping", path);
-        return Ok(0);
-    }
-
-    // Determine content type
-    let content_type = determine_content_type(path, &mime_type, &content);
-
-    // Chunk content
-    let chunk_outputs = chunkers
-        .chunk(&content, &content_type, &config.chunk_config)
-        .await
-        .map_err(Error::Chunking)?;
-
-    // Drop degenerate chunks (frontmatter fences, lone headers, whitespace)
-    // before embedding — they otherwise dominate every query.
-    let chunk_outputs: Vec<_> = chunk_outputs
-        .into_iter()
-        .filter(|c| !is_low_content_chunk(&c.content))
-        .collect();
+    let (chunk_outputs, content_type): (Vec<ChunkOutput>, ContentType) = match extracted {
+        Ok(content) if !content.text.trim().is_empty() => {
+            let content_type = determine_content_type(path, &mime_type, &content);
+            let chunk_outputs = chunkers
+                .chunk(&content, &content_type, &config.chunk_config)
+                .await
+                .map_err(Error::Chunking)?
+                .into_iter()
+                // Drop degenerate chunks (frontmatter fences, lone headers,
+                // whitespace) before embedding — they dominate every query.
+                .filter(|c| !is_low_content_chunk(&c.content))
+                .collect();
+            (chunk_outputs, content_type)
+        }
+        Ok(_) => {
+            if nameable {
+                (vec![name_only_chunk(path)], ContentType::Text)
+            } else {
+                debug!("Empty content for {:?}, skipping", path);
+                return Ok(0);
+            }
+        }
+        Err(e) => {
+            if nameable {
+                warn!(
+                    "Extraction failed for {:?} ({e}); indexing by filename only",
+                    path
+                );
+                (vec![name_only_chunk(path)], ContentType::Text)
+            } else {
+                return Err(Error::Extraction(e));
+            }
+        }
+    };
 
     if chunk_outputs.is_empty() {
         return Ok(0);
@@ -1585,6 +1635,26 @@ mod tests {
         let _started = IndexUpdate::IndexingStarted {
             path: PathBuf::from("/test"),
         };
+    }
+
+    #[test]
+    fn test_is_nameable_document() {
+        assert!(is_nameable_document(Path::new("/v/scan.pdf")));
+        assert!(is_nameable_document(Path::new("/v/Contract.DOCX")));
+        assert!(is_nameable_document(Path::new("/v/deck.pptx")));
+        // media is NOT nameable (would flood results with attachment names)
+        assert!(!is_nameable_document(Path::new("/v/PXL_2023.jpg")));
+        assert!(!is_nameable_document(Path::new("/v/song.mp3")));
+        assert!(!is_nameable_document(Path::new("/v/clip.mp4")));
+        // plain-text formats: empty means genuinely empty, so not name-only
+        assert!(!is_nameable_document(Path::new("/v/notes.md")));
+        assert!(!is_nameable_document(Path::new("/v/log.txt")));
+    }
+
+    #[test]
+    fn test_name_only_chunk_uses_stem() {
+        let c = name_only_chunk(Path::new("/v/Docs/2023 German tax return.pdf"));
+        assert_eq!(c.content, "2023 German tax return");
     }
 
     #[test]
