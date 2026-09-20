@@ -27,6 +27,25 @@ use tracing::{debug, info};
 /// Model identifier on `HuggingFace` Hub.
 const MODEL_ID: &str = "intfloat/multilingual-e5-small";
 
+/// Resolve a user-facing model name to the implemented Hugging Face id.
+///
+/// RAGFS implements `intfloat/multilingual-e5-small` (aliases:
+/// `multilingual-e5-small`, `e5-small`). The legacy `thenlper/gte-small`
+/// names are still accepted for back-compat and map to the e5 model, since
+/// the embedder is hardwired to e5 (multilingual + asymmetric prefixes).
+pub fn resolve_supported_model(model: &str) -> Result<&'static str, EmbedError> {
+    match model.trim() {
+        "intfloat/multilingual-e5-small"
+        | "multilingual-e5-small"
+        | "e5-small"
+        | "thenlper/gte-small"
+        | "gte-small" => Ok(MODEL_ID),
+        other => Err(EmbedError::ModelLoad(format!(
+            "Unsupported embedding model '{other}'. RAGFS currently supports only 'intfloat/multilingual-e5-small' (aliases: 'multilingual-e5-small', 'e5-small')."
+        ))),
+    }
+}
+
 /// Embedding dimension for multilingual-e5-small.
 const EMBEDDING_DIM: usize = 384;
 
@@ -106,39 +125,61 @@ pub struct CandleEmbedder {
     tokenizer: Arc<RwLock<Option<Tokenizer>>>,
     /// Model configuration
     config: Arc<RwLock<Option<Config>>>,
-    /// Cache directory for models
-    #[allow(dead_code)]
-    cache_dir: PathBuf,
     /// Whether model is initialized
     initialized: Arc<RwLock<bool>>,
 }
 
 impl CandleEmbedder {
-    /// Create a new `CandleEmbedder`.
+    /// Create a new `CandleEmbedder` with the default multilingual-e5-small model.
+    ///
+    /// GPU is used when available. Prefer [`Self::try_new`] to honor config.
+    ///
+    /// `cache_dir` is accepted for API compatibility; model files are resolved
+    /// through the `HuggingFace` cache (`HF_HOME` / `~/.cache/huggingface`).
     pub fn new(cache_dir: PathBuf) -> Self {
-        let device = default_device();
+        Self::try_new(cache_dir, MODEL_ID, true)
+            .expect("default model multilingual-e5-small is supported")
+    }
+
+    /// Create an embedder from config (`model`, `use_gpu`).
+    ///
+    /// Unsupported models fail immediately with a clear error — before download.
+    pub fn try_new(_cache_dir: PathBuf, model: &str, use_gpu: bool) -> Result<Self, EmbedError> {
+        let _model_id = resolve_supported_model(model)?;
+        // `default_device()` picks Metal on macOS (with the `metal` feature),
+        // else CUDA-if-available, else CPU — so `use_gpu` still gates the GPU
+        // but macOS gets Metal rather than a CUDA-only path.
+        let device = if use_gpu {
+            default_device()
+        } else {
+            Device::Cpu
+        };
         info!("CandleEmbedder using device: {:?}", device);
 
+        Ok(Self {
+            device,
+            model: Arc::new(RwLock::new(None)),
+            tokenizer: Arc::new(RwLock::new(None)),
+            config: Arc::new(RwLock::new(None)),
+            initialized: Arc::new(RwLock::new(false)),
+        })
+    }
+
+    /// Create with specific device.
+    pub fn with_device(_cache_dir: PathBuf, device: Device) -> Self {
         Self {
             device,
             model: Arc::new(RwLock::new(None)),
             tokenizer: Arc::new(RwLock::new(None)),
             config: Arc::new(RwLock::new(None)),
-            cache_dir,
             initialized: Arc::new(RwLock::new(false)),
         }
     }
 
-    /// Create with specific device.
-    pub fn with_device(cache_dir: PathBuf, device: Device) -> Self {
-        Self {
-            device,
-            model: Arc::new(RwLock::new(None)),
-            tokenizer: Arc::new(RwLock::new(None)),
-            config: Arc::new(RwLock::new(None)),
-            cache_dir,
-            initialized: Arc::new(RwLock::new(false)),
-        }
+    /// Whether inference will run on CPU (config `use_gpu = false`, or no GPU).
+    #[must_use]
+    pub fn device_is_cpu(&self) -> bool {
+        self.device.is_cpu()
     }
 
     /// Initialize the model (download if needed, load into memory).
@@ -517,6 +558,50 @@ mod tests {
             cached_model_file(&cache, &repo, "tokenizer.json").as_deref(),
             Some(path.as_path())
         );
+    }
+
+    #[test]
+    fn test_unsupported_model_errors_before_download() {
+        let cache_dir = tempdir().unwrap();
+        let result =
+            CandleEmbedder::try_new(cache_dir.path().to_path_buf(), "jina-embeddings-v3", false);
+        let err = match result {
+            Ok(_) => panic!("unsupported model should not construct an embedder"),
+            Err(e) => e,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("jina-embeddings-v3"),
+            "error should name the requested model: {message}"
+        );
+        assert!(
+            message.contains("multilingual-e5-small"),
+            "error should name the supported model: {message}"
+        );
+    }
+
+    #[test]
+    fn test_e5_small_alias_is_accepted() {
+        let cache_dir = tempdir().unwrap();
+        let embedder =
+            CandleEmbedder::try_new(cache_dir.path().to_path_buf(), "e5-small", false).unwrap();
+        assert_eq!(embedder.model_name(), MODEL_ID);
+        assert!(
+            embedder.device_is_cpu(),
+            "use_gpu=false must select the CPU device"
+        );
+    }
+
+    #[test]
+    fn test_resolve_supported_model() {
+        assert_eq!(
+            resolve_supported_model("intfloat/multilingual-e5-small").unwrap(),
+            MODEL_ID
+        );
+        assert_eq!(resolve_supported_model("e5-small").unwrap(), MODEL_ID);
+        // legacy gte-small aliases are tolerated and map to the e5 model
+        assert_eq!(resolve_supported_model("gte-small").unwrap(), MODEL_ID);
+        assert!(resolve_supported_model("jina-embeddings-v3").is_err());
     }
 
     #[tokio::test]

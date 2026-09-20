@@ -26,10 +26,12 @@ optional build feature and is not required for search.
 - **Local Embeddings** - Runs entirely offline using the `multilingual-e5-small` model via Candle (multilingual, incl. Chinese)
 - **FUSE Integration** *(Linux, optional `mount` feature)* - Mount indexed directories as a virtual filesystem
 - **Real-time Indexing** - Watch directories for changes and update the index automatically
-- **Multimodal Support** - Extract content from text, code, markdown, PDF, and images
-- **Code-aware Chunking** - Syntax-aware splitting using tree-sitter for source code
-- **Hybrid Search** *(experimental)* - Combine vector similarity with full-text search
+- **Multimodal Support** - Extract content from text, code, markdown, PDF, images, and Office OOXML/ODT
+- **Code-aware Chunking** - Splits source at function/class signatures (pattern matching, not tree-sitter)
+- **Multilingual Embeddings** - `intfloat/multilingual-e5-small` with e5 asymmetric prefixes (EN/ZH/…)
+- **Hybrid Search** - Combine vector similarity with full-text search (when enabled)
 - **MCP Server** - Claude Desktop integration for AI assistants
+- **Tests** - Unit and integration tests across crates (CI on every PR)
 
 ## Feature Status
 
@@ -39,9 +41,9 @@ optional build feature and is not required for search.
 | Web/API server | Beta | `ragfs serve`; mobile browser UI plus JSON/raw file endpoints |
 | FUSE mount | Stable | Linux only; optional `mount` build feature |
 | Semantic search | Stable | Vector similarity with LanceDB |
-| Hybrid search | Experimental | Vector + full-text; opt-in via `--hybrid` (FTS wiring being fixed) |
-| Text extraction | Stable | 40+ formats |
-| Code chunking | Stable | Tree-sitter based |
+| Hybrid search | Beta | Vector + full-text; toggle with `--hybrid` / `[query].hybrid` |
+| Text extraction | Stable | UTF-8 text/code/markup, PDF, images, OOXML (docx/xlsx/pptx/odt). No binary `.doc` |
+| Code chunking | Stable | Pattern-based function/class splits |
 | PDF extraction | Stable | Text + embedded images |
 | Agent operations (.ops/) | Stable | JSON feedback, batch support |
 | Safety layer (.safety/) | Stable | Trash, history, undo |
@@ -62,17 +64,20 @@ optional build feature and is not required for search.
 - Local-first semantic search
 
 **Limitations:**
-- FUSE mounting is Linux only (optional `mount` feature); CLI search runs on macOS and Linux
-- Embedding model is downloaded on first run (~120MB) and cached
-- Large repositories (100K+ files) may need tuning
-- Hybrid (vector + full-text) search is experimental and opt-in via `ragfs query --hybrid`; default is vector-only
+- FUSE mounting is Linux only (optional `mount` feature); CLI + web search run on macOS and Linux
+- Embedding model is `intfloat/multilingual-e5-small` (~120MB download on first run, then cached)
+- Code chunking is regex/signature based, not a tree-sitter AST.
+- Default extractors do not parse binary `.doc` / RTF / EPUB.
+- Vector search is an exact scan until cosine IVF-PQ is built (≥256 chunks). L2/Dot stay exact.
+- Semantic organize/cleanup is Beta.
+- Large repositories (100K+ files) may need tuning.
 
 ## Requirements
 
 - Rust 1.88 or later
 - `protoc` (Protocol Buffers compiler) for the LanceDB build dependency
   (`brew install protobuf` on macOS, `apt install protobuf-compiler` on Debian/Ubuntu)
-- ~120MB disk for the embedding model (downloaded on first run, then cached)
+- ~120MB disk for the `multilingual-e5-small` embedding model (downloaded on first run, then cached)
 - **For FUSE mount only (Linux):** `libfuse` (`libfuse-dev` on Debian/Ubuntu, `fuse` on Arch)
 
 ## Installation

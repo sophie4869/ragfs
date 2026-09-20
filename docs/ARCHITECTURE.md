@@ -144,7 +144,8 @@ Content extraction from various file formats.
 
 **Components:**
 - `ExtractorRegistry` - Routes files to appropriate extractors by MIME type
-- `TextExtractor` - Handles text-based files (40+ types supported)
+- `TextExtractor` - UTF-8 text and source/markup extensions (not Office binary)
+- `OfficeExtractor` - OOXML/ODT visible text (`.docx`, `.xlsx`, `.pptx`, `.odt`)
 
 **Supported Formats:**
 - Text: `.txt`, `.md`, `.rst`
@@ -152,6 +153,7 @@ Content extraction from various file formats.
 - Config: `.json`, `.yaml`, `.toml`, `.xml`
 - Markup: `.html`, `.css`
 - PDF: Text extraction + embedded images (JPEG, PNG, JPEG2000)
+- Office: `.docx`, `.xlsx`, `.pptx`, `.odt` (not binary `.doc`)
 - Images: Metadata extraction, optional vision captioning
 
 **PDF Image Extraction:**
@@ -201,7 +203,7 @@ Vector storage and search using LanceDB.
 - `LanceStore` - LanceDB-based vector store implementation
 
 **Tables:**
-- `chunks` - Vectors, content, metadata with ANN indexing
+- `chunks` - Vectors, content, metadata (FTS on `content`; best-effort cosine IVF-PQ ANN at ≥256 rows; L2/Dot and failed builds stay exact)
 - `files` - File records with status and timestamps
 
 **Features:**
@@ -225,6 +227,9 @@ IndexerConfig {
     embed_config: EmbeddingConfig,
     include_patterns: Vec<String>,  // default: ["**/*"]
     exclude_patterns: Vec<String>,  // default: [".git", "node_modules", ...]
+    debounce_ms: u64,               // from [index].debounce_ms
+    max_file_size: u64,             // from [index].max_file_size
+    force: bool,                    // from ragfs index --force
 }
 ```
 

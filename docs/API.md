@@ -198,9 +198,9 @@ impl LanceStore {
 ```
 
 Implements `VectorStore` trait. Features:
-- HNSW vector index for fast similarity search
+- Vector search (exact scan; cosine IVF-PQ ANN at ≥256 rows; L2/Dot stay exact)
 - Full-text search (FTS) index for hybrid search
-- Automatic index creation on init
+- FTS created on init; ANN created best-effort after ingest
 
 ### Usage Example
 
