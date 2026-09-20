@@ -19,6 +19,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Align the advisory ignore list with deny.toml so cargo-audit accepts the
+      # same transitive-dependency advisories that `cargo deny check advisories`
+      # already does — deny.toml stays the single source of truth (no drift).
+      - id: advisories
+        run: |
+          ids=$(grep -oE 'RUSTSEC-[0-9]{4}-[0-9]{4}' deny.toml | sort -u | paste -sd, -)
+          echo "ignore=$ids" >> "$GITHUB_OUTPUT"
+          echo "Ignoring advisories from deny.toml: $ids"
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: ${{ steps.advisories.outputs.ignore }}
