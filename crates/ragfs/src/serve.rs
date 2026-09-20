@@ -204,10 +204,7 @@ async fn service_worker_handler() -> impl IntoResponse {
             ),
             // Allow the worker to control the whole origin, and avoid a stale
             // worker being pinned by the HTTP cache.
-            (
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("no-cache"),
-            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
         ],
         SERVICE_WORKER,
     )
