@@ -581,7 +581,7 @@ fn is_nameable_document(path: &Path) -> bool {
     ];
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .is_some_and(|e| DOC_EXTS.contains(&e.as_str()))
 }
 

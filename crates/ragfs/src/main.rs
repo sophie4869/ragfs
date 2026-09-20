@@ -986,19 +986,16 @@ async fn main() -> Result<()> {
         }
 
         Commands::Compact { path, index_dir } => {
-            let db_path = match &index_dir {
-                Some(dir) => {
-                    let nested = dir.join("index.lance");
-                    if nested.exists() { nested } else { dir.clone() }
-                }
-                None => {
-                    let p = if path.exists() {
-                        path.canonicalize()?
-                    } else {
-                        path.clone()
-                    };
-                    get_db_path(&p)?
-                }
+            let db_path = if let Some(dir) = &index_dir {
+                let nested = dir.join("index.lance");
+                if nested.exists() { nested } else { dir.clone() }
+            } else {
+                let p = if path.exists() {
+                    path.canonicalize()?
+                } else {
+                    path.clone()
+                };
+                get_db_path(&p)?
             };
             if !db_path.exists() {
                 anyhow::bail!("Index not found at {}", db_path.display());
