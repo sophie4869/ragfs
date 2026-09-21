@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1.7
+
+FROM lukemathwalker/cargo-chef:0.1.78-rust-1.98-bookworm AS chef
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libprotobuf-dev \
+        libssl-dev \
+        pkg-config \
+        protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+FROM chef AS planner
+
+COPY . .
+
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+
+ARG TARGETPLATFORM
+
+COPY --from=planner /app/recipe.json recipe.json
+
+RUN --mount=type=cache,id=ragfs-cargo-registry-${TARGETPLATFORM},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=ragfs-cargo-git-${TARGETPLATFORM},target=/usr/local/cargo/git \
+    cargo chef cook --release -p ragfs --recipe-path recipe.json
+
+COPY . .
+
+RUN --mount=type=cache,id=ragfs-cargo-registry-${TARGETPLATFORM},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=ragfs-cargo-git-${TARGETPLATFORM},target=/usr/local/cargo/git \
+    cargo build --release -p ragfs \
+    && cp /app/target/release/ragfs /usr/local/bin/ragfs
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/ragfs /usr/local/bin/ragfs
+
+ENV RUST_LOG=info
+ENTRYPOINT ["ragfs"]

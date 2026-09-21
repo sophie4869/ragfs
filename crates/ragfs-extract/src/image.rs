@@ -84,17 +84,6 @@ impl ContentExtractor for ImageExtractor {
         // Read bytes again for storage (we consumed them in decoding)
         let data = tokio::fs::read(path).await?;
 
-        // Create text representation with metadata
-        let text = format!(
-            "Image: {} ({}x{}, {})",
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown"),
-            width,
-            height,
-            format
-        );
-
         // Generate caption if captioner is available
         let caption = if let Some(ref captioner) = self.captioner {
             if captioner.is_initialized().await {
@@ -112,6 +101,13 @@ impl ContentExtractor for ImageExtractor {
         } else {
             None
         };
+
+        // Searchable text is the caption, or empty when there is none. We must
+        // NOT fall back to a dimension/format placeholder (e.g. "3072x4080 jpeg
+        // image"): such near-identical short strings embed to almost the same
+        // vector and score ~0.9 against every query, so every image would flood
+        // semantic search. Empty text makes the indexer skip the image entirely.
+        let text = caption.clone().unwrap_or_default();
 
         // Create the extracted image
         let extracted_image = ExtractedImage {
@@ -313,8 +309,8 @@ mod tests {
 
         assert!(result.is_ok());
         let content = result.unwrap();
-        assert!(content.text.contains("test.png"));
-        assert!(content.text.contains("2x2")); // Dimensions
+        // Without a captioner there is no searchable text (no placeholder).
+        assert!(content.text.is_empty());
         assert_eq!(content.images.len(), 1);
         assert_eq!(content.images[0].mime_type, "image/png");
     }
@@ -330,7 +326,8 @@ mod tests {
 
         assert!(result.is_ok());
         let content = result.unwrap();
-        assert!(content.text.contains("test.jpg"));
+        // Without a captioner there is no searchable text (no placeholder).
+        assert!(content.text.is_empty());
         assert_eq!(content.images.len(), 1);
         assert_eq!(content.images[0].mime_type, "image/jpeg");
     }
@@ -399,6 +396,28 @@ mod tests {
         let result = extractor.extract(&file_path).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_extract_without_captioner_yields_empty_text() {
+        // Without a vision captioner there is no real textual content to embed.
+        // The old behavior stored a metadata placeholder ("WxH format image"),
+        // which polluted semantic search: every image scored ~0.9 on any query.
+        // Now the searchable text must be empty so the indexer skips the image.
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("scan.png");
+        std::fs::write(&file_path, create_test_png()).unwrap();
+
+        let extractor = ImageExtractor::new();
+        let content = extractor.extract(&file_path).await.unwrap();
+
+        assert!(
+            content.text.is_empty(),
+            "expected empty text without captioner, got: {:?}",
+            content.text
+        );
+        // Image bytes are still captured so a future vision pass could caption it.
+        assert_eq!(content.images.len(), 1);
     }
 
     #[test]

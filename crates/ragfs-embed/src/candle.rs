@@ -1,46 +1,123 @@
-//! GTE-small embedder using Candle.
+//! Multilingual e5-small embedder using Candle.
 //!
-//! Uses thenlper/gte-small model for text embeddings:
+//! Uses intfloat/multilingual-e5-small for text embeddings:
 //! - 384 dimensions
 //! - 512 max tokens
-//! - BERT architecture
+//! - BERT architecture, multilingual (EN/ZH/...)
+//! - Asymmetric prefixes: documents are encoded as `passage: ...`, queries as
+//!   `query: ...`, which is what gives e5 its retrieval discrimination.
 
 use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
-use hf_hub::{Repo, RepoType};
+use hf_hub::{Cache, Repo, RepoType, api::tokio::Api};
 use ragfs_core::{EmbedError, Embedder, EmbeddingConfig, EmbeddingOutput, Modality};
+use std::panic;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use std::sync::{Mutex, OnceLock};
 use tokenizers::Tokenizer;
 use tokio::sync::RwLock;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use tracing::warn;
 use tracing::{debug, info};
 
 /// Model identifier on `HuggingFace` Hub.
-const MODEL_ID: &str = "thenlper/gte-small";
+const MODEL_ID: &str = "intfloat/multilingual-e5-small";
 
 /// Resolve a user-facing model name to the implemented Hugging Face id.
 ///
-/// RAGFS currently implements only `thenlper/gte-small` (alias: `gte-small`).
+/// RAGFS implements `intfloat/multilingual-e5-small` (aliases:
+/// `multilingual-e5-small`, `e5-small`). The legacy `thenlper/gte-small`
+/// names are still accepted for back-compat and map to the e5 model, since
+/// the embedder is hardwired to e5 (multilingual + asymmetric prefixes).
 pub fn resolve_supported_model(model: &str) -> Result<&'static str, EmbedError> {
     match model.trim() {
-        "thenlper/gte-small" | "gte-small" => Ok(MODEL_ID),
+        "intfloat/multilingual-e5-small"
+        | "multilingual-e5-small"
+        | "e5-small"
+        | "thenlper/gte-small"
+        | "gte-small" => Ok(MODEL_ID),
         other => Err(EmbedError::ModelLoad(format!(
-            "Unsupported embedding model '{other}'. RAGFS currently supports only 'thenlper/gte-small' (alias: 'gte-small')."
+            "Unsupported embedding model '{other}'. RAGFS currently supports only 'intfloat/multilingual-e5-small' (aliases: 'multilingual-e5-small', 'e5-small')."
         ))),
     }
 }
 
-/// Embedding dimension for gte-small.
+/// Embedding dimension for multilingual-e5-small.
 const EMBEDDING_DIM: usize = 384;
 
 /// Maximum sequence length.
 const MAX_TOKENS: usize = 512;
 
-/// GTE-small embedder using Candle.
+/// Prefix e5 expects on query text.
+const QUERY_PREFIX: &str = "query: ";
+
+/// Prefix e5 expects on document/passage text.
+const PASSAGE_PREFIX: &str = "passage: ";
+
+fn model_repo() -> Repo {
+    Repo::new(MODEL_ID.to_string(), RepoType::Model)
+}
+
+fn cached_model_file(cache: &Cache, repo: &Repo, filename: &str) -> Option<PathBuf> {
+    cache.repo(repo.clone()).get(filename)
+}
+
+fn create_hf_api() -> Result<Api, EmbedError> {
+    match panic::catch_unwind(Api::new) {
+        Ok(Ok(api)) => Ok(api),
+        Ok(Err(err)) => Err(EmbedError::ModelLoad(format!(
+            "Failed to create HuggingFace API: {err}"
+        ))),
+        Err(_) => Err(EmbedError::ModelLoad(
+            "Failed to create HuggingFace API: client initialization panicked".to_string(),
+        )),
+    }
+}
+
+async fn resolve_model_file(
+    cache: &Cache,
+    api: &mut Option<Api>,
+    repo: &Repo,
+    filename: &str,
+) -> Result<PathBuf, EmbedError> {
+    if let Some(path) = cached_model_file(cache, repo, filename) {
+        debug!("Using cached model file: {:?}", path);
+        return Ok(path);
+    }
+
+    if api.is_none() {
+        *api = Some(create_hf_api()?);
+    }
+
+    let api_repo = api
+        .as_ref()
+        .expect("HuggingFace API should be initialized")
+        .repo(repo.clone());
+
+    debug!("Downloading model file: {filename}");
+    api_repo
+        .get(filename)
+        .await
+        .map_err(|e| EmbedError::ModelLoad(format!("Failed to resolve {filename}: {e}")))
+}
+
+/// Build the model input for a query (e5 asymmetric prefix).
+fn query_input(text: &str) -> String {
+    format!("{QUERY_PREFIX}{text}")
+}
+
+/// Build the model input for a document/passage (e5 asymmetric prefix).
+fn passage_input(text: &str) -> String {
+    format!("{PASSAGE_PREFIX}{text}")
+}
+
+/// Multilingual e5-small embedder using Candle.
 pub struct CandleEmbedder {
-    /// Device to run inference on (CPU or CUDA)
+    /// Device to run inference on (Metal, CUDA, or CPU)
     device: Device,
     /// Loaded model
     model: Arc<RwLock<Option<BertModel>>>,
@@ -48,28 +125,32 @@ pub struct CandleEmbedder {
     tokenizer: Arc<RwLock<Option<Tokenizer>>>,
     /// Model configuration
     config: Arc<RwLock<Option<Config>>>,
-    /// Cache directory for models
-    cache_dir: PathBuf,
     /// Whether model is initialized
     initialized: Arc<RwLock<bool>>,
 }
 
 impl CandleEmbedder {
-    /// Create a new `CandleEmbedder` with the default gte-small model.
+    /// Create a new `CandleEmbedder` with the default multilingual-e5-small model.
     ///
     /// GPU is used when available. Prefer [`Self::try_new`] to honor config.
+    ///
+    /// `cache_dir` is accepted for API compatibility; model files are resolved
+    /// through the `HuggingFace` cache (`HF_HOME` / `~/.cache/huggingface`).
     pub fn new(cache_dir: PathBuf) -> Self {
         Self::try_new(cache_dir, MODEL_ID, true)
-            .expect("default model thenlper/gte-small is supported")
+            .expect("default model multilingual-e5-small is supported")
     }
 
     /// Create an embedder from config (`model`, `use_gpu`).
     ///
     /// Unsupported models fail immediately with a clear error — before download.
-    pub fn try_new(cache_dir: PathBuf, model: &str, use_gpu: bool) -> Result<Self, EmbedError> {
+    pub fn try_new(_cache_dir: PathBuf, model: &str, use_gpu: bool) -> Result<Self, EmbedError> {
         let _model_id = resolve_supported_model(model)?;
+        // `default_device()` picks Metal on macOS (with the `metal` feature),
+        // else CUDA-if-available, else CPU — so `use_gpu` still gates the GPU
+        // but macOS gets Metal rather than a CUDA-only path.
         let device = if use_gpu {
-            Device::cuda_if_available(0).unwrap_or(Device::Cpu)
+            default_device()
         } else {
             Device::Cpu
         };
@@ -80,19 +161,17 @@ impl CandleEmbedder {
             model: Arc::new(RwLock::new(None)),
             tokenizer: Arc::new(RwLock::new(None)),
             config: Arc::new(RwLock::new(None)),
-            cache_dir,
             initialized: Arc::new(RwLock::new(false)),
         })
     }
 
     /// Create with specific device.
-    pub fn with_device(cache_dir: PathBuf, device: Device) -> Self {
+    pub fn with_device(_cache_dir: PathBuf, device: Device) -> Self {
         Self {
             device,
             model: Arc::new(RwLock::new(None)),
             tokenizer: Arc::new(RwLock::new(None)),
             config: Arc::new(RwLock::new(None)),
-            cache_dir,
             initialized: Arc::new(RwLock::new(false)),
         }
     }
@@ -114,34 +193,13 @@ impl CandleEmbedder {
 
         info!("Initializing CandleEmbedder with model: {}", MODEL_ID);
 
-        // Download model files from HuggingFace Hub into the configured cache dir
-        let api = hf_hub::api::tokio::ApiBuilder::new()
-            .with_cache_dir(self.cache_dir.clone())
-            .build()
-            .map_err(|e| EmbedError::ModelLoad(format!("Failed to create HF API: {e}")))?;
+        let cache = Cache::from_env();
+        let repo = model_repo();
+        let mut api = None;
 
-        let repo = api.repo(Repo::new(MODEL_ID.to_string(), RepoType::Model));
-
-        // Download tokenizer
-        debug!("Downloading tokenizer...");
-        let tokenizer_path = repo
-            .get("tokenizer.json")
-            .await
-            .map_err(|e| EmbedError::ModelLoad(format!("Failed to download tokenizer: {e}")))?;
-
-        // Download model config
-        debug!("Downloading config...");
-        let config_path = repo
-            .get("config.json")
-            .await
-            .map_err(|e| EmbedError::ModelLoad(format!("Failed to download config: {e}")))?;
-
-        // Download model weights
-        debug!("Downloading model weights...");
-        let weights_path = repo
-            .get("model.safetensors")
-            .await
-            .map_err(|e| EmbedError::ModelLoad(format!("Failed to download weights: {e}")))?;
+        let tokenizer_path = resolve_model_file(&cache, &mut api, &repo, "tokenizer.json").await?;
+        let config_path = resolve_model_file(&cache, &mut api, &repo, "config.json").await?;
+        let weights_path = resolve_model_file(&cache, &mut api, &repo, "model.safetensors").await?;
 
         // Load tokenizer
         debug!("Loading tokenizer...");
@@ -358,6 +416,34 @@ impl CandleEmbedder {
     }
 }
 
+fn default_device() -> Device {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        match try_new_metal_device(0) {
+            Ok(Ok(device)) => return device,
+            Ok(Err(err)) => warn!("Metal device unavailable, falling back to CPU/CUDA: {err}"),
+            Err(_) => warn!("Metal device initialization panicked, falling back to CPU/CUDA"),
+        }
+    }
+
+    Device::cuda_if_available(0).unwrap_or(Device::Cpu)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn try_new_metal_device(ordinal: usize) -> std::thread::Result<candle_core::Result<Device>> {
+    static METAL_INIT_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    let _guard = METAL_INIT_HOOK_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous_hook = panic::take_hook();
+    panic::set_hook(Box::new(|_| {}));
+    let result = panic::catch_unwind(|| Device::new_metal(ordinal));
+    panic::set_hook(previous_hook);
+    result
+}
+
 #[async_trait]
 impl Embedder for CandleEmbedder {
     fn model_name(&self) -> &str {
@@ -391,11 +477,15 @@ impl Embedder for CandleEmbedder {
             config.batch_size
         );
 
+        // e5 expects documents to be prefixed with "passage: ".
+        let prefixed: Vec<String> = texts.iter().map(|t| passage_input(t)).collect();
+
         // Process in batches
         let mut all_results = Vec::with_capacity(texts.len());
 
-        for chunk in texts.chunks(config.batch_size) {
-            let batch_results = self.encode_batch(chunk, config.normalize).await?;
+        for chunk in prefixed.chunks(config.batch_size) {
+            let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+            let batch_results = self.encode_batch(&refs, config.normalize).await?;
             all_results.extend(batch_results);
         }
 
@@ -407,9 +497,14 @@ impl Embedder for CandleEmbedder {
         query: &str,
         config: &EmbeddingConfig,
     ) -> Result<EmbeddingOutput, EmbedError> {
-        // For GTE models, queries and documents use the same embedding process
-        // Some models use different prefixes, but GTE doesn't need that
-        let results = self.embed_text(&[query], config).await?;
+        // e5 expects queries to be prefixed with "query: " (asymmetric to the
+        // "passage: " prefix used for documents in embed_text). We must encode
+        // directly rather than via embed_text, which would apply the passage
+        // prefix instead.
+        let input = query_input(query);
+        let results = self
+            .encode_batch(&[input.as_str()], config.normalize)
+            .await?;
         results
             .into_iter()
             .next()
@@ -421,6 +516,49 @@ impl Embedder for CandleEmbedder {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_model_is_multilingual() {
+        // The model must be multilingual so bilingual (EN/ZH) vaults retrieve
+        // sensibly; gte-small was English-only.
+        assert!(
+            MODEL_ID.contains("multilingual-e5"),
+            "expected a multilingual-e5 model, got {MODEL_ID}"
+        );
+    }
+
+    #[test]
+    fn test_e5_prefixes() {
+        // e5 models are trained with asymmetric prefixes: documents are encoded
+        // as "passage: ..." and queries as "query: ...". Applying them is what
+        // gives e5 its retrieval discrimination.
+        assert_eq!(passage_input("hello"), "passage: hello");
+        assert_eq!(query_input("what is x"), "query: what is x");
+    }
+
+    #[test]
+    fn test_cached_model_file_uses_huggingface_cache() {
+        let cache_dir = tempdir().unwrap();
+        let cache = Cache::new(cache_dir.path().to_path_buf());
+        let repo = model_repo();
+        let commit = "abc123";
+
+        cache.repo(repo.clone()).create_ref(commit).unwrap();
+
+        let path = cache_dir
+            .path()
+            .join(repo.folder_name())
+            .join("snapshots")
+            .join(commit)
+            .join("tokenizer.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+
+        assert_eq!(
+            cached_model_file(&cache, &repo, "tokenizer.json").as_deref(),
+            Some(path.as_path())
+        );
+    }
 
     #[test]
     fn test_unsupported_model_errors_before_download() {
@@ -437,17 +575,17 @@ mod tests {
             "error should name the requested model: {message}"
         );
         assert!(
-            message.contains("thenlper/gte-small"),
+            message.contains("multilingual-e5-small"),
             "error should name the supported model: {message}"
         );
     }
 
     #[test]
-    fn test_gte_small_alias_is_accepted() {
+    fn test_e5_small_alias_is_accepted() {
         let cache_dir = tempdir().unwrap();
         let embedder =
-            CandleEmbedder::try_new(cache_dir.path().to_path_buf(), "gte-small", false).unwrap();
-        assert_eq!(embedder.model_name(), "thenlper/gte-small");
+            CandleEmbedder::try_new(cache_dir.path().to_path_buf(), "e5-small", false).unwrap();
+        assert_eq!(embedder.model_name(), MODEL_ID);
         assert!(
             embedder.device_is_cpu(),
             "use_gpu=false must select the CPU device"
@@ -457,9 +595,11 @@ mod tests {
     #[test]
     fn test_resolve_supported_model() {
         assert_eq!(
-            resolve_supported_model("thenlper/gte-small").unwrap(),
+            resolve_supported_model("intfloat/multilingual-e5-small").unwrap(),
             MODEL_ID
         );
+        assert_eq!(resolve_supported_model("e5-small").unwrap(), MODEL_ID);
+        // legacy gte-small aliases are tolerated and map to the e5 model
         assert_eq!(resolve_supported_model("gte-small").unwrap(), MODEL_ID);
         assert!(resolve_supported_model("jina-embeddings-v3").is_err());
     }
@@ -473,7 +613,7 @@ mod tests {
         embedder.init().await.unwrap();
 
         assert_eq!(embedder.dimension(), 384);
-        assert_eq!(embedder.model_name(), "thenlper/gte-small");
+        assert_eq!(embedder.model_name(), "intfloat/multilingual-e5-small");
 
         let config = EmbeddingConfig::default();
         let texts = &["Hello world", "This is a test"];

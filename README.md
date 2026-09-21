@@ -1,13 +1,20 @@
 # RAGFS
 
-[![CI](https://github.com/Venere-Labs/ragfs/actions/workflows/ci.yml/badge.svg)](https://github.com/Venere-Labs/ragfs/actions/workflows/ci.yml)
-[![Security Audit](https://github.com/Venere-Labs/ragfs/actions/workflows/security.yml/badge.svg)](https://github.com/Venere-Labs/ragfs/actions/workflows/security.yml)
-[![codecov](https://codecov.io/gh/Venere-Labs/ragfs/branch/main/graph/badge.svg)](https://codecov.io/gh/Venere-Labs/ragfs)
-[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://Venere-Labs.github.io/ragfs/ragfs/)
+[![CI](https://github.com/sophie4869/ragfs/actions/workflows/ci.yml/badge.svg)](https://github.com/sophie4869/ragfs/actions/workflows/ci.yml)
+[![Security Audit](https://github.com/sophie4869/ragfs/actions/workflows/security.yml/badge.svg)](https://github.com/sophie4869/ragfs/actions/workflows/security.yml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
-An agentic FUSE filesystem that makes file management safe and structured for LLM agents. Includes JSON-based operations with undo support, complete audit logging, and AI-powered features like semantic search, auto-organization, and deduplication.
+Local semantic search over your files. Index a directory with fully-offline
+embeddings (multilingual, so mixed English/Chinese corpora work) and query it by
+meaning from the CLI or the local web server — `index`, `query`, `serve`,
+`status`. On Linux it can additionally mount the index as a FUSE filesystem for
+agent file operations (undo, audit, auto-organization); that piece is an
+optional build feature and is not required for search.
+
+> **Platforms:** the CLI and web server (`index`/`query`/`serve`/`status`) build
+> and run on macOS and Linux. FUSE mounting is Linux-only and off by default — enable it with
+> `--features mount` (needs `libfuse`).
 
 ## Features
 
@@ -15,11 +22,13 @@ An agentic FUSE filesystem that makes file management safe and structured for LL
 - **Safety Layer** - Soft delete, audit logging, and undo support via `.safety/`
 - **AI-Powered Management** - Auto-organization, deduplication, and cleanup via `.semantic/`
 - **Semantic Search** - Query files by meaning using vector similarity search
-- **Local Embeddings** - Runs entirely offline using the `gte-small` model via Candle
-- **FUSE Integration** - Mount indexed directories as a virtual filesystem
+- **Mobile Web Search** - Serve a private browser UI and JSON API for search/read/preview
+- **Local Embeddings** - Runs entirely offline using the `multilingual-e5-small` model via Candle (multilingual, incl. Chinese)
+- **FUSE Integration** *(Linux, optional `mount` feature)* - Mount indexed directories as a virtual filesystem
 - **Real-time Indexing** - Watch directories for changes and update the index automatically
 - **Multimodal Support** - Extract content from text, code, markdown, PDF, images, and Office OOXML/ODT
 - **Code-aware Chunking** - Splits source at function/class signatures (pattern matching, not tree-sitter)
+- **Multilingual Embeddings** - `intfloat/multilingual-e5-small` with e5 asymmetric prefixes (EN/ZH/…)
 - **Hybrid Search** - Combine vector similarity with full-text search (when enabled)
 - **MCP Server** - Claude Desktop integration for AI assistants
 - **Tests** - Unit and integration tests across crates (CI on every PR)
@@ -28,10 +37,11 @@ An agentic FUSE filesystem that makes file management safe and structured for LL
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| CLI (index, query, status) | Stable | Core functionality |
-| FUSE mount | Stable | Linux only |
+| CLI (index, query, status) | Stable | Core functionality; builds on macOS and Linux |
+| Web/API server | Beta | `ragfs serve`; mobile browser UI plus JSON/raw file endpoints |
+| FUSE mount | Stable | Linux only; optional `mount` build feature |
 | Semantic search | Stable | Vector similarity with LanceDB |
-| Hybrid search | Stable | Vector + full-text |
+| Hybrid search | Beta | Vector + full-text; toggle with `--hybrid` / `[query].hybrid` |
 | Text extraction | Stable | UTF-8 text/code/markup, PDF, images, OOXML (docx/xlsx/pptx/odt). No binary `.doc` |
 | Code chunking | Stable | Pattern-based function/class splits |
 | PDF extraction | Stable | Text + embedded images |
@@ -54,8 +64,8 @@ An agentic FUSE filesystem that makes file management safe and structured for LL
 - Local-first semantic search
 
 **Limitations:**
-- Linux only (FUSE requirement). macOS CI artifacts are not a supported FUSE product.
-- Embedding model is `thenlper/gte-small` (~67–100MB download, hundreds of MB RAM).
+- FUSE mounting is Linux only (optional `mount` feature); CLI + web search run on macOS and Linux
+- Embedding model is `intfloat/multilingual-e5-small` (~120MB download on first run, then cached)
 - Code chunking is regex/signature based, not a tree-sitter AST.
 - Default extractors do not parse binary `.doc` / RTF / EPUB.
 - Vector search is an exact scan until cosine IVF-PQ is built (≥256 chunks). L2/Dot stay exact.
@@ -65,18 +75,25 @@ An agentic FUSE filesystem that makes file management safe and structured for LL
 ## Requirements
 
 - Rust 1.88 or later
-- Linux with FUSE support (`libfuse-dev` on Debian/Ubuntu, `fuse` on Arch)
-- Disk space for the `gte-small` embedding model (downloaded on first run, ~67–100MB)
+- `protoc` (Protocol Buffers compiler) for the LanceDB build dependency
+  (`brew install protobuf` on macOS, `apt install protobuf-compiler` on Debian/Ubuntu)
+- ~120MB disk for the `multilingual-e5-small` embedding model (downloaded on first run, then cached)
+- **For FUSE mount only (Linux):** `libfuse` (`libfuse-dev` on Debian/Ubuntu, `fuse` on Arch)
 
 ## Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/Venere-Labs/ragfs.git
+# Clone the repository (this fork)
+git clone https://github.com/sophie4869/ragfs.git
 cd ragfs
 
-# Build in release mode
-cargo build --release
+# Build the CLI in release mode (index/query/status; no FUSE) — macOS & Linux.
+# Build only the `ragfs` crate; a bare `cargo build` builds the whole workspace,
+# including the Linux-only FUSE and PyO3 crates.
+cargo build -p ragfs --release
+
+# On Linux, to also build FUSE mounting:
+#   cargo build -p ragfs --release --features mount
 
 # Install to ~/.cargo/bin
 cargo install --path crates/ragfs
@@ -103,11 +120,57 @@ ragfs query ~/Documents "machine learning implementation"
 # Get more results
 ragfs query ~/Documents "authentication logic" --limit 20
 
-# JSON output for scripting
-ragfs query ~/Documents "database connection" --format json
+# JSON output for scripting (global flags precede the subcommand)
+ragfs --format json query ~/Documents "database connection"
 ```
 
-### Mount as a filesystem
+Search is vector-only by default. Hybrid (vector + full-text) is experimental
+and opt-in: `ragfs query --hybrid ~/Documents "..."`.
+
+### Search and read from a browser
+
+```bash
+ragfs serve ~/Documents --host 127.0.0.1 --port 7777
+```
+
+Open <http://127.0.0.1:7777> for the mobile-friendly web UI. The server also
+exposes:
+
+```text
+GET /api/search?q=<text>&limit=<n>
+GET /api/status
+GET /api/files/<relative-path>
+GET /raw/<relative-path>
+```
+
+For cross-language or personal vocabulary, add a `.ragfsaliases` file at the
+indexed root (or an ancestor). It is read when `ragfs serve` starts and does not
+require rebuilding the index:
+
+```text
+房东 = landlord, tenant, lease, rent
+纠纷 = dispute, claim, conflict
+证据 = evidence, proof, receipt, invoice
+```
+
+For a reverse-proxied or NAS deployment, keep `ragfs serve` on localhost or an
+internal network and put authentication in front of it. You can also require a
+bearer token:
+
+```bash
+RAGFS_SERVE_TOKEN="$(openssl rand -base64 32)" ragfs serve ~/Documents
+```
+
+If the index was built on another machine, pass the original indexed root as
+`path` and the local filesystem root as `--serve-root`. This lets a NAS serve a
+Mac-built index while reading files from the NAS copy:
+
+```bash
+ragfs serve /Users/sophiebi/ObsidianVault/03_Resources \
+  --serve-root /volume1/ragfs-vault/03_Resources
+```
+
+### Mount as a filesystem (Linux only, requires `--features mount`)
 
 ```bash
 # Create a mount point
@@ -147,19 +210,22 @@ echo "<undo_id>" > ~/ragfs-mount/.ragfs/.safety/.undo
 ragfs [OPTIONS] <COMMAND>
 
 Commands:
-  mount   Mount a directory as a RAGFS filesystem
-  index   Index a directory (without mounting)
+  index   Index a directory
   query   Query the index
   status  Show index status
   config  Manage configuration
+  mount   Mount a directory as a RAGFS filesystem   (only in --features mount builds; Linux)
 
 Options:
   -c, --config <FILE>    Config file path [default: ~/.config/ragfs/config.toml]
   -v, --verbose          Enable verbose logging
-  -f, --format <FORMAT>  Output format: text, json [default: text]
+  -f, --format <FORMAT>  Output format: text, json [default: text]  (global; precede the subcommand)
   -h, --help             Print help
   -V, --version          Print version
 ```
+
+The default build ships `index`, `query`, `status`, and `config`. `mount`
+appears only when built with `--features mount` (Linux, requires `libfuse`).
 
 ### mount
 
@@ -256,15 +322,27 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture docum
 ## How It Works
 
 1. **Extraction** - Content is extracted from files based on their MIME type
-2. **Chunking** - Text is split into overlapping chunks (~512 tokens each)
-3. **Embedding** - Each chunk is converted to a 384-dimensional vector using the `gte-small` model
-4. **Storage** - Vectors are stored in LanceDB for efficient similarity search
+2. **Chunking** - Text is split into overlapping chunks (~512 tokens each); near-empty chunks (frontmatter fences, lone headers) are dropped
+3. **Embedding** - Each chunk is converted to a 384-dimensional vector using the `multilingual-e5-small` model (documents as `passage:`, queries as `query:`)
+4. **Storage** - Vectors are stored in LanceDB for efficient similarity search. The embedding model is recorded alongside the index; changing it triggers a full reindex.
 5. **Search** - Queries are embedded and matched against stored vectors using cosine similarity
 
 ## Storage Locations
 
-- **Indices**: `~/.local/share/ragfs/indices/{hash}/index.lance`
-- **Models**: `~/.local/share/ragfs/models/`
+- **Indices**: `~/.local/share/ragfs/indices/{hash}/index.lance` (macOS: `~/Library/Application Support/ragfs/indices/...`)
+- **Models**: `~/.local/share/ragfs/models/` (macOS: `~/Library/Application Support/ragfs/models/`)
+- **Embedding-model marker**: `embedding_model` file beside each index (used to detect model changes)
+
+## Upstream & Acknowledgements
+
+This is a fork of [RAGFS by Venere Labs](https://github.com/Venere-Labs/ragfs).
+Changes in this fork focus on making the CLI usable on macOS and on real,
+mixed-language note vaults: FUSE mounting made an optional build feature so the
+CLI builds without `libfuse`; correct file exclusion; a multilingual embedding
+model (`multilingual-e5-small`) with e5 `query:`/`passage:` prefixes; degenerate
+/ empty-content chunk filtering; a working `--force`; and reindex-on-model-change
+via an index marker. All credit for the original design and the bulk of the
+implementation belongs to the upstream authors.
 
 ## License
 
@@ -273,7 +351,7 @@ Licensed under either of:
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
-at your option.
+at your option. Original work © Venere Labs; fork modifications under the same dual license.
 
 ## Contributing
 

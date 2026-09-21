@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>RAGFS</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#f4efe6" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#16130f" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
+    <link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="RAGFS" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Newsreader:opsz,wght@6..72,400;6..72,500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/app.css?v=2" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="search-pane" aria-label="Search">
+        <header class="topbar">
+          <div>
+            <h1>RAGFS</h1>
+            <p id="statusLine">Connecting...</p>
+          </div>
+          <button id="tokenButton" class="icon-button" type="button" title="Set API token">
+            <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+              <circle cx="7.5" cy="15.5" r="3.5"></circle>
+              <path d="M10 13L20 3"></path>
+              <path d="M15 8L18 11"></path>
+              <path d="M17 6L20 9"></path>
+            </svg>
+            <span class="sr-only">Set API token</span>
+          </button>
+        </header>
+
+        <form id="searchForm" class="search-form">
+          <input
+            id="queryInput"
+            name="q"
+            type="search"
+            autocomplete="off"
+            placeholder="Search your files"
+            aria-label="Search your files"
+          />
+          <button type="submit">Search</button>
+        </form>
+
+        <ol id="results" class="results" aria-live="polite"></ol>
+      </section>
+
+      <section class="reader-pane" aria-label="Reader">
+        <div id="emptyState" class="empty-state">
+          <h2>Select a result</h2>
+        </div>
+        <article id="reader" class="reader" hidden>
+          <header class="reader-header">
+            <div>
+              <h2 id="readerTitle"></h2>
+              <p id="readerPath"></p>
+            </div>
+            <a id="rawLink" class="raw-link" target="_blank" rel="noreferrer">Raw</a>
+          </header>
+          <div id="preview" class="preview"></div>
+        </article>
+      </section>
+    </main>
+
+    <script src="/app.js?v=2" defer></script>
+    <script>
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("/sw.js").catch(() => {});
+        });
+      }
+    </script>
+  </body>
+</html>

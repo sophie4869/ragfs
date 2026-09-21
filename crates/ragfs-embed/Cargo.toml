@@ -17,6 +17,13 @@ candle = [
     "dep:hf-hub",
     "dep:tokenizers",
 ]
+# Metal is macOS-only. Candle's metal backend pulls in the `metal` crate and,
+# through it, `objc_exception`, whose build script needs an Objective-C compiler
+# (`cc1obj`) that Linux runners do not have. Forwarding `candle-*/metal` from a
+# plain feature would enable that everywhere, because CI builds `--all-features`.
+# The backend is attached by the macOS-only target dependency below instead, and
+# this feature stays as the switch that names it.
+metal = ["candle"]
 
 [dependencies]
 ragfs-core.workspace = true
@@ -35,6 +42,15 @@ candle-nn = { workspace = true, optional = true }
 candle-transformers = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
+
+# macOS only: adds Candle's Metal backend to the very same optional crates
+# declared above. Cargo unions the features of a dependency across
+# `[dependencies]` and `[target.*.dependencies]`, so this is purely additive on
+# macOS and invisible on every other target.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { workspace = true, optional = true, features = ["metal"] }
+candle-nn = { workspace = true, optional = true, features = ["metal"] }
+candle-transformers = { workspace = true, optional = true, features = ["metal"] }
 
 [dev-dependencies]
 tempfile.workspace = true

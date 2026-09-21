@@ -97,6 +97,9 @@ pub enum StoreError {
 
     #[error("schema error: {0}")]
     Schema(String),
+
+    #[error("optimize failed: {0}")]
+    Optimize(String),
 }
 
 /// Result type alias for RAGFS operations.

@@ -35,7 +35,7 @@ pub enum ConfigError {
 
     /// Embedding model is not implemented.
     #[error(
-        "unsupported embedding model '{0}': RAGFS currently supports only 'thenlper/gte-small' (alias: 'gte-small')"
+        "unsupported embedding model '{0}': RAGFS currently supports only 'intfloat/multilingual-e5-small' (aliases: 'multilingual-e5-small', 'e5-small')"
     )]
     UnsupportedModel(String),
 
@@ -153,7 +153,7 @@ impl Config {
         }
     }
 
-    /// Core embedding batch settings (normalize stays on for gte-small).
+    /// Core embedding batch settings (normalize stays on for multilingual-e5-small).
     pub fn core_embedding_config(&self) -> CoreEmbeddingConfig {
         CoreEmbeddingConfig {
             normalize: true,
@@ -186,12 +186,19 @@ impl Config {
 }
 
 /// Hugging Face id of the only implemented embedding model.
-pub const SUPPORTED_EMBEDDING_MODEL: &str = "thenlper/gte-small";
+pub const SUPPORTED_EMBEDDING_MODEL: &str = "intfloat/multilingual-e5-small";
 
 /// Resolve a user-facing model name to the implemented Hugging Face id.
+///
+/// Legacy `thenlper/gte-small` names are tolerated for back-compat and map to
+/// the e5 model, since the embedder is hardwired to multilingual-e5-small.
 pub fn resolve_supported_model(model: &str) -> Result<&'static str, ConfigError> {
     match model.trim() {
-        "thenlper/gte-small" | "gte-small" => Ok(SUPPORTED_EMBEDDING_MODEL),
+        "intfloat/multilingual-e5-small"
+        | "multilingual-e5-small"
+        | "e5-small"
+        | "thenlper/gte-small"
+        | "gte-small" => Ok(SUPPORTED_EMBEDDING_MODEL),
         other => Err(ConfigError::UnsupportedModel(other.to_string())),
     }
 }
@@ -237,7 +244,25 @@ fn default_exclude() -> Vec<String> {
         "**/*.pyc".to_string(),
         "**/.venv/**".to_string(),
         "**/venv/**".to_string(),
+        // Unambiguous secret files — never index their contents, so a networked
+        // `ragfs serve` cannot return them. Vault-specific secrets (e.g. a notes
+        // folder holding credentials) belong in a `.ragfsignore`.
         "**/.env".to_string(),
+        "**/*.key".to_string(),
+        "**/*.pem".to_string(),
+        "**/*.pfx".to_string(),
+        "**/*.p12".to_string(),
+        "**/*.gpg".to_string(),
+        "**/*.asc".to_string(),
+        "**/*.kdbx".to_string(),
+        "**/*.keychain".to_string(),
+        "**/*.keystore".to_string(),
+        "**/id_rsa".to_string(),
+        "**/id_dsa".to_string(),
+        "**/id_ecdsa".to_string(),
+        "**/id_ed25519".to_string(),
+        "**/secrets.*".to_string(),
+        "**/credentials.*".to_string(),
     ]
 }
 
@@ -374,8 +399,10 @@ pub struct QueryConfig {
     #[serde(default = "default_max_limit")]
     pub max_limit: usize,
 
-    /// Enable hybrid search (vector + FTS)
-    #[serde(default = "default_hybrid")]
+    /// Combine vector similarity with full-text search. Defaults to `false`
+    /// (vector-only): the `LanceDB` FTS path is still being hardened, so hybrid
+    /// stays opt-in via `--hybrid` or `hybrid = true` here.
+    #[serde(default)]
     pub hybrid: bool,
 
     /// Enable reranking
@@ -391,16 +418,12 @@ fn default_max_limit() -> usize {
     100
 }
 
-fn default_hybrid() -> bool {
-    true
-}
-
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
             default_limit: default_limit(),
             max_limit: default_max_limit(),
-            hybrid: default_hybrid(),
+            hybrid: false,
             rerank: false,
         }
     }
@@ -463,17 +486,20 @@ mod tests {
     }
 
     #[test]
-    fn default_model_is_gte_small() {
+    fn default_model_is_e5_small() {
         let config = Config::default();
         assert_eq!(config.embedding.model, SUPPORTED_EMBEDDING_MODEL);
         assert_eq!(
             config.resolve_embedding_model().unwrap(),
             SUPPORTED_EMBEDDING_MODEL
         );
-        assert!(config.query.hybrid);
+        assert!(
+            !config.query.hybrid,
+            "hybrid is opt-in; default is vector-only"
+        );
         let sample = Config::sample_toml();
         assert!(
-            sample.contains("thenlper/gte-small"),
+            sample.contains("intfloat/multilingual-e5-small"),
             "sample config should advertise the implemented model: {sample}"
         );
         assert!(
@@ -571,7 +597,7 @@ mod tests {
             "error should name the requested model: {message}"
         );
         assert!(
-            message.contains("thenlper/gte-small"),
+            message.contains("multilingual-e5-small"),
             "error should name the supported model: {message}"
         );
     }
@@ -594,7 +620,10 @@ mod tests {
     fn load_from_missing_file_is_defaults() {
         let config = Config::load_from(Some(PathBuf::from("/no/such/ragfs-config.toml"))).unwrap();
         assert_eq!(config.embedding.model, SUPPORTED_EMBEDDING_MODEL);
-        assert!(config.query.hybrid);
+        assert!(
+            !config.query.hybrid,
+            "hybrid is opt-in; default is vector-only"
+        );
     }
 
     #[test]

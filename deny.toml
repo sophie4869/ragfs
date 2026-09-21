@@ -49,6 +49,11 @@ ignore = [
     
     # Unmaintained crates used by FUSE
     "RUSTSEC-2026-0104",  # daemonize is unmaintained
+
+    # quinn-proto DoS - transitive via the QUIC stack (reqwest/hf-hub); ragfs
+    # does not expose a QUIC endpoint on the request path
+    "RUSTSEC-2026-0037",  # quinn-proto: denial of service
+    "RUSTSEC-2026-0185",  # quinn-proto: denial of service
 ]
 
 [licenses]

@@ -17,6 +17,104 @@ use uuid::Uuid;
 
 use crate::watcher::FileWatcher;
 
+/// Matches paths against exclusion glob patterns.
+///
+/// Always excludes hidden files and directories (any path component that starts
+/// with `.`), which is what a correct implementation of the `**/.*` default
+/// pattern would do — the previous hand-written matcher never caught them, so
+/// `.obsidian/`, `.git/`, and dotfiles were indexed and polluted results.
+pub(crate) struct ExcludeMatcher {
+    set: globset::GlobSet,
+    root: PathBuf,
+}
+
+impl ExcludeMatcher {
+    /// Build a matcher from glob patterns, rooted at `root`. Exclusion is
+    /// evaluated on the path *relative to* `root`, so a vault that itself lives
+    /// under a hidden directory (e.g. `~/.notes/vault`) is not wholly excluded
+    /// by the hidden-component rule. Invalid patterns are logged and skipped
+    /// rather than failing the whole index run.
+    pub(crate) fn new(patterns: &[String], root: &Path) -> Self {
+        let mut builder = globset::GlobSetBuilder::new();
+        // Configured patterns plus any the user added in `<root>/.ragfsignore`
+        // (e.g. secret folders). The ignore file is the right place for
+        // vault-specific exclusions like a notes folder holding credentials.
+        let all = patterns.iter().cloned().chain(read_ragfsignore(root));
+        for pattern in all {
+            let normalized = normalize_exclude_pattern(&pattern);
+            // Case-insensitive so secret patterns catch `Password` and
+            // `password` alike (and macOS's filesystem is case-insensitive too).
+            match globset::GlobBuilder::new(&normalized)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(glob) => {
+                    builder.add(glob);
+                }
+                Err(e) => warn!("Ignoring invalid exclude pattern {:?}: {}", pattern, e),
+            }
+        }
+        let set = builder.build().unwrap_or_else(|e| {
+            warn!("Failed to build exclude globset ({e}); excluding nothing by pattern");
+            globset::GlobSet::empty()
+        });
+        Self {
+            set,
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// Whether `path` should be excluded from indexing.
+    pub(crate) fn is_excluded(&self, path: &Path) -> bool {
+        // Evaluate relative to the index root so the root's own ancestry (which
+        // the user chose to index) never triggers exclusion.
+        let rel = path.strip_prefix(&self.root).unwrap_or(path);
+
+        // Hidden files/dirs: any relative component starting with '.'.
+        let hidden = rel.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::Normal(os) if os.to_string_lossy().starts_with('.')
+            )
+        });
+        hidden || self.set.is_match(rel)
+    }
+}
+
+/// Read glob patterns from `.ragfsignore` files at `root` and its ancestors.
+///
+/// Walking up like git means a vault-root `.ragfsignore` still protects a
+/// subfolder that is indexed on its own. One pattern per line, gitignore-style;
+/// blank lines and `#` comments are ignored. Patterns are matched against the
+/// index-root-relative path, so use `**/`-prefixed patterns (e.g. `**/Vault/**`)
+/// for portability across which directory is indexed. A trailing `/` marks a
+/// directory — see [`normalize_exclude_pattern`].
+fn read_ragfsignore(root: &Path) -> Vec<String> {
+    let mut patterns = Vec::new();
+    for dir in std::iter::successors(Some(root), |p| p.parent()) {
+        if let Ok(content) = std::fs::read_to_string(dir.join(".ragfsignore")) {
+            patterns.extend(
+                content
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(ToString::to_string),
+            );
+        }
+    }
+    patterns
+}
+
+/// Normalize an exclude pattern so a trailing `/` (a directory) matches its
+/// contents: `private/` becomes `private/**`.
+fn normalize_exclude_pattern(pattern: &str) -> String {
+    if let Some(dir) = pattern.strip_suffix('/') {
+        format!("{dir}/**")
+    } else {
+        pattern.to_string()
+    }
+}
+
 /// Index update events.
 #[derive(Debug, Clone)]
 pub enum IndexUpdate {
@@ -41,7 +139,8 @@ pub struct IndexerConfig {
     pub debounce_ms: u64,
     /// Maximum file size to index (bytes)
     pub max_file_size: u64,
-    /// Skip the content-hash short-circuit and reindex every eligible file
+    /// Reindex files even when their content hash is unchanged. Used by
+    /// `--force` and after an embedding-model change (old embeddings are stale).
     pub force: bool,
 }
 
@@ -58,6 +157,25 @@ impl Default for IndexerConfig {
                 "**/target/**".to_string(),
                 "**/__pycache__/**".to_string(),
                 "**/*.lock".to_string(),
+                // Unambiguous secret files — never index their contents, so a
+                // networked `ragfs serve` cannot return them. Vault-specific
+                // secrets (e.g. a notes folder) belong in a `.ragfsignore`.
+                "**/*.key".to_string(),
+                "**/*.pem".to_string(),
+                "**/*.pfx".to_string(),
+                "**/*.p12".to_string(),
+                "**/*.gpg".to_string(),
+                "**/*.asc".to_string(),
+                "**/*.kdbx".to_string(),
+                "**/*.keychain".to_string(),
+                "**/*.keystore".to_string(),
+                "**/id_rsa".to_string(),
+                "**/id_dsa".to_string(),
+                "**/id_ecdsa".to_string(),
+                "**/id_ed25519".to_string(),
+                "**/*.env".to_string(),
+                "**/secrets.*".to_string(),
+                "**/credentials.*".to_string(),
             ],
             debounce_ms: 500,
             max_file_size: 52_428_800,
@@ -257,11 +375,12 @@ impl IndexerService {
         &self.root
     }
 
-    /// Start the indexer background task.
-    pub async fn start(&self) -> Result<()> {
+    /// Start the indexer background task. Returns the number of files queued by
+    /// the initial scan, so callers can wait for that many index results.
+    pub async fn start(&self) -> Result<usize> {
         let mut running = self.running.write().await;
         if *running {
-            return Ok(());
+            return Ok(0);
         }
         *running = true;
         drop(running);
@@ -302,6 +421,7 @@ impl IndexerService {
         let chunkers = Arc::clone(&self.chunkers);
         let embedder = Arc::clone(&self.embedder);
         let config = self.config.clone();
+        let root = self.root.clone();
         let stats = Arc::clone(&self.stats);
         let pending = Arc::clone(&self.pending);
         let idle_notify = Arc::clone(&self.idle_notify);
@@ -315,6 +435,14 @@ impl IndexerService {
                         debug!("Received file event: {:?}", event);
                         match &event {
                             FileEvent::Created(path) | FileEvent::Modified(path) => {
+                                if should_skip_watch_event(path, &root, &config) {
+                                    debug!("Skipping excluded watch event for {:?}", path);
+                                    if let Err(e) = store.delete_by_file_path(path).await {
+                                        warn!("Failed to delete excluded path {:?}: {}", path, e);
+                                    }
+                                    continue;
+                                }
+
                                 let _ = update_tx
                                     .send(IndexUpdate::IndexingStarted { path: path.clone() });
 
@@ -367,6 +495,14 @@ impl IndexerService {
                                 if let Err(e) = store.delete_by_file_path(from).await {
                                     warn!("Failed to delete old path {:?}: {}", from, e);
                                 }
+                                if should_skip_watch_event(to, &root, &config) {
+                                    debug!("Skipping excluded renamed path {:?}", to);
+                                    if let Err(e) = store.delete_by_file_path(to).await {
+                                        warn!("Failed to delete excluded path {:?}: {}", to, e);
+                                    }
+                                    continue;
+                                }
+
                                 let _ = update_tx
                                     .send(IndexUpdate::IndexingStarted { path: to.clone() });
 
@@ -403,13 +539,14 @@ impl IndexerService {
         });
 
         // Initial scan
-        self.scan().await?;
+        let queued = self.scan().await?;
 
-        Ok(())
+        Ok(queued)
     }
 
-    /// Perform initial scan of the root directory.
-    async fn scan(&self) -> Result<()> {
+    /// Perform initial scan of the root directory. Returns the number of files
+    /// queued for indexing.
+    async fn scan(&self) -> Result<usize> {
         info!("Scanning {:?}", self.root);
 
         let root = self.root.clone();
@@ -419,19 +556,19 @@ impl IndexerService {
         let pending = Arc::clone(&self.pending);
 
         // Walk directory in background thread (blocking I/O)
-        tokio::task::spawn_blocking(move || {
+        let queued = tokio::task::spawn_blocking(move || {
             scan_directory(
                 &root,
                 &event_tx,
                 &exclude_patterns,
                 &include_patterns,
                 &pending,
-            );
+            )
         })
         .await
         .map_err(|e| Error::Other(format!("scan task failed: {e}")))?;
 
-        Ok(())
+        Ok(queued)
     }
 
     /// Process a single file through the pipeline.
@@ -509,11 +646,16 @@ impl IndexerService {
             .map_err(|e| Error::Other(format!("Failed to read directory: {e}")))?;
 
         let mut entries_stream = tokio_stream::wrappers::ReadDirStream::new(entries);
+        let matcher = ExcludeMatcher::new(&self.config.exclude_patterns, &self.root);
 
         use tokio_stream::StreamExt;
         while let Some(entry) = entries_stream.next().await {
             let entry = entry.map_err(|e| Error::Other(format!("Failed to read entry: {e}")))?;
             let path = entry.path();
+
+            if matcher.is_excluded(&path) {
+                continue;
+            }
 
             if path.is_dir() {
                 if self
@@ -570,6 +712,92 @@ impl IndexerService {
     }
 }
 
+/// Whether a chunk has too little real content to be worth embedding.
+///
+/// Near-empty fragments — YAML frontmatter fences (`---`), lone headers (`##`),
+/// whitespace, or punctuation — embed to almost the same vector and score ~0.95
+/// against every query, drowning the genuinely relevant chunks. We require at
+/// least a few alphanumeric characters; `char::is_alphanumeric` counts CJK
+/// ideographs, so Chinese content is preserved.
+fn is_low_content_chunk(content: &str) -> bool {
+    content.chars().filter(|c| c.is_alphanumeric()).count() < 3
+}
+
+/// Whether a file is a binary document worth indexing by filename when its
+/// content can't be extracted (scanned/image-only PDFs, office docs). Media
+/// files (images/audio/video) are excluded so attachment filenames don't flood
+/// results; plain-text formats (txt/md/csv) are excluded too, since for them an
+/// empty extraction means the file really is empty.
+fn is_nameable_document(path: &Path) -> bool {
+    const DOC_EXTS: &[&str] = &[
+        "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "odt", "ods", "odp", "rtf", "epub",
+        "pages", "numbers",
+    ];
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|e| DOC_EXTS.contains(&e.as_str()))
+}
+
+/// A single chunk carrying just the file's name, used to make a document
+/// findable by filename when its content is unavailable. The filename/path
+/// context is added by [`embedding_text_for_chunk`] at embed time.
+fn name_only_chunk(path: &Path) -> ChunkOutput {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    ChunkOutput {
+        content: stem,
+        byte_range: 0..0,
+        line_range: None,
+        parent_index: None,
+        depth: 0,
+        metadata: ragfs_core::ChunkOutputMetadata::default(),
+    }
+}
+
+fn embedding_path_context(path: &Path) -> String {
+    let title = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .trim();
+
+    let folder_parts: Vec<String> = path
+        .parent()
+        .into_iter()
+        .flat_map(|p| p.components())
+        .filter_map(|c| c.as_os_str().to_str())
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect();
+
+    let start = folder_parts.len().saturating_sub(3);
+    let folders = folder_parts[start..].join(" / ");
+
+    match (title.is_empty(), folders.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("title: {title}"),
+        (true, false) => format!("path: {folders}"),
+        (false, false) => format!("title: {title}\npath: {folders} / {title}"),
+    }
+}
+
+fn embedding_text_for_chunk(path: &Path, content: &str) -> String {
+    let context = embedding_path_context(path);
+    if context.is_empty() {
+        content.to_string()
+    } else {
+        format!("{context}\n\n{content}")
+    }
+}
+
+fn should_skip_watch_event(path: &Path, root: &Path, config: &IndexerConfig) -> bool {
+    ExcludeMatcher::new(&config.exclude_patterns, root).is_excluded(path)
+}
+
 /// Scan a directory and send file events.
 fn scan_directory(
     root: &Path,
@@ -577,37 +805,44 @@ fn scan_directory(
     exclude_patterns: &[String],
     include_patterns: &[String],
     pending: &AtomicUsize,
-) {
+) -> usize {
     use std::fs;
 
     fn visit_dir(
         dir: &Path,
         event_tx: &mpsc::Sender<FileEvent>,
-        exclude_patterns: &[String],
+        matcher: &ExcludeMatcher,
         include_patterns: &[String],
         pending: &AtomicUsize,
-    ) {
+    ) -> usize {
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) => {
                 warn!("Cannot read directory {:?}: {}", dir, e);
-                return;
+                return 0;
             }
         };
 
-        for entry in entries.flatten() {
+        let mut queued = 0;
+        for entry in entries {
+            // Don't silently drop an unreadable entry: a transient error on a
+            // single DirEntry would otherwise skip a whole subtree unnoticed.
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("Skipping unreadable entry in {:?}: {}", dir, e);
+                    continue;
+                }
+            };
             let path = entry.path();
             let path_str = path.to_string_lossy();
 
-            if exclude_patterns
-                .iter()
-                .any(|pattern| path_matches_pattern(&path_str, pattern))
-            {
+            if matcher.is_excluded(&path) {
                 continue;
             }
 
             if path.is_dir() {
-                visit_dir(&path, event_tx, exclude_patterns, include_patterns, pending);
+                queued += visit_dir(&path, event_tx, matcher, include_patterns, pending);
             } else if path.is_file() {
                 let included = include_patterns.is_empty()
                     || include_patterns
@@ -617,11 +852,14 @@ fn scan_directory(
                     continue;
                 }
                 queue_event_blocking(event_tx, pending, FileEvent::Created(path));
+                queued += 1;
             }
         }
+        queued
     }
 
-    visit_dir(root, event_tx, exclude_patterns, include_patterns, pending);
+    let matcher = ExcludeMatcher::new(exclude_patterns, root);
+    visit_dir(root, event_tx, &matcher, include_patterns, pending)
 }
 
 fn queue_event_blocking(
@@ -680,7 +918,8 @@ async fn process_file(
     // Compute content hash
     let content_hash = compute_hash(path).await?;
 
-    // Check if already indexed with same hash (unless --force)
+    // Check if already indexed with same hash (unless a forced reindex is
+    // requested, e.g. after an embedding-model change).
     if !config.force
         && let Ok(Some(existing)) = store.get_file(path).await
         && existing.content_hash == content_hash
@@ -695,36 +934,64 @@ async fn process_file(
         .first_or_text_plain()
         .to_string();
 
-    // Extract content
-    let content = extractors
-        .extract(path, &mime_type)
-        .await
-        .map_err(Error::Extraction)?;
+    // Extract content. A document that yields no text (scanned/image-only PDF)
+    // or fails extraction is still indexed by its filename/path so it can be
+    // found by name — but only for document types, not media (images/audio),
+    // which would otherwise flood results with attachment filenames.
+    let nameable = is_nameable_document(path);
+    let extracted = extractors.extract(path, &mime_type).await;
 
-    if content.text.is_empty() {
-        debug!("Empty content for {:?}, skipping", path);
-        return Ok(0);
-    }
-
-    // Determine content type
-    let content_type = determine_content_type(path, &mime_type, &content);
-
-    // Chunk content
-    let chunk_outputs = chunkers
-        .chunk(&content, &content_type, &config.chunk_config)
-        .await
-        .map_err(Error::Chunking)?;
+    let (chunk_outputs, content_type): (Vec<ChunkOutput>, ContentType) = match extracted {
+        Ok(content) if !content.text.trim().is_empty() => {
+            let content_type = determine_content_type(path, &mime_type, &content);
+            let chunk_outputs = chunkers
+                .chunk(&content, &content_type, &config.chunk_config)
+                .await
+                .map_err(Error::Chunking)?
+                .into_iter()
+                // Drop degenerate chunks (frontmatter fences, lone headers,
+                // whitespace) before embedding — they dominate every query.
+                .filter(|c| !is_low_content_chunk(&c.content))
+                .collect();
+            (chunk_outputs, content_type)
+        }
+        Ok(_) => {
+            if nameable {
+                (vec![name_only_chunk(path)], ContentType::Text)
+            } else {
+                debug!("Empty content for {:?}, skipping", path);
+                return Ok(0);
+            }
+        }
+        Err(e) => {
+            if nameable {
+                warn!(
+                    "Extraction failed for {:?} ({e}); indexing by filename only",
+                    path
+                );
+                (vec![name_only_chunk(path)], ContentType::Text)
+            } else {
+                return Err(Error::Extraction(e));
+            }
+        }
+    };
 
     if chunk_outputs.is_empty() {
         return Ok(0);
     }
 
-    // Prepare texts for embedding
-    let texts: Vec<&str> = chunk_outputs.iter().map(|c| c.content.as_str()).collect();
+    // Prepare texts for embedding. Include lightweight filename/path context so
+    // title-only Obsidian notes and media notes are still discoverable, while
+    // preserving the original chunk content for snippets and storage.
+    let texts: Vec<String> = chunk_outputs
+        .iter()
+        .map(|c| embedding_text_for_chunk(path, &c.content))
+        .collect();
+    let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
 
     // Generate embeddings
     let embeddings = embedder
-        .embed_batch(&texts, &config.embed_config)
+        .embed_batch(&text_refs, &config.embed_config)
         .await
         .map_err(Error::Embedding)?;
 
@@ -1286,6 +1553,10 @@ mod tests {
     // ==================== IndexerService tests ====================
 
     fn create_test_indexer(store: Arc<dyn VectorStore>) -> IndexerService {
+        create_test_indexer_with_force(store, false)
+    }
+
+    fn create_test_indexer_with_force(store: Arc<dyn VectorStore>, force: bool) -> IndexerService {
         use ragfs_extract::TextExtractor;
 
         let mut extractors = ExtractorRegistry::new();
@@ -1300,7 +1571,10 @@ mod tests {
         let embedder = Arc::new(MockEmbedder::new(TEST_DIM));
         let embedder_pool = Arc::new(EmbedderPool::new(embedder, 1));
 
-        let config = IndexerConfig::default();
+        let config = IndexerConfig {
+            force,
+            ..Default::default()
+        };
 
         IndexerService::new(
             PathBuf::from("/tmp"),
@@ -1310,6 +1584,56 @@ mod tests {
             embedder_pool,
             config,
         )
+    }
+
+    #[tokio::test]
+    async fn test_force_reindexes_despite_unchanged_hash() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "Test content").unwrap();
+
+        let store = Arc::new(MockStore::new());
+        let indexer =
+            create_test_indexer_with_force(Arc::clone(&store) as Arc<dyn VectorStore>, true);
+
+        let real_count = indexer.process_single(&file_path).await.unwrap();
+
+        // Corrupt the stored record's chunk_count. If the second run skipped
+        // (hash unchanged), process_single would return this sentinel; a forced
+        // reindex recomputes and returns the real count instead.
+        let mut rec = store.get_file(&file_path).await.unwrap().unwrap();
+        rec.chunk_count = 999;
+        store.upsert_file(&rec).await.unwrap();
+
+        let second = indexer.process_single(&file_path).await.unwrap();
+        assert_eq!(second, real_count, "force should reprocess, not skip");
+        assert_ne!(
+            second, 999,
+            "force must not return the stale record's count"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_without_force_skips_unchanged_hash() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "Test content").unwrap();
+
+        let store = Arc::new(MockStore::new());
+        let indexer = create_test_indexer(Arc::clone(&store) as Arc<dyn VectorStore>);
+
+        indexer.process_single(&file_path).await.unwrap();
+
+        let mut rec = store.get_file(&file_path).await.unwrap().unwrap();
+        rec.chunk_count = 999;
+        store.upsert_file(&rec).await.unwrap();
+
+        // Unchanged hash + no force → skip → returns the (sentinel) stored count.
+        let second = indexer.process_single(&file_path).await.unwrap();
+        assert_eq!(
+            second, 999,
+            "without force, an unchanged file should be skipped"
+        );
     }
 
     #[tokio::test]
@@ -1747,5 +2071,220 @@ mod tests {
         let _started = IndexUpdate::IndexingStarted {
             path: PathBuf::from("/test"),
         };
+    }
+
+    #[test]
+    fn test_is_nameable_document() {
+        assert!(is_nameable_document(Path::new("/v/scan.pdf")));
+        assert!(is_nameable_document(Path::new("/v/Contract.DOCX")));
+        assert!(is_nameable_document(Path::new("/v/deck.pptx")));
+        // media is NOT nameable (would flood results with attachment names)
+        assert!(!is_nameable_document(Path::new("/v/PXL_2023.jpg")));
+        assert!(!is_nameable_document(Path::new("/v/song.mp3")));
+        assert!(!is_nameable_document(Path::new("/v/clip.mp4")));
+        // plain-text formats: empty means genuinely empty, so not name-only
+        assert!(!is_nameable_document(Path::new("/v/notes.md")));
+        assert!(!is_nameable_document(Path::new("/v/log.txt")));
+    }
+
+    #[test]
+    fn test_name_only_chunk_uses_stem() {
+        let c = name_only_chunk(Path::new("/v/Docs/2023 German tax return.pdf"));
+        assert_eq!(c.content, "2023 German tax return");
+    }
+
+    #[test]
+    fn test_low_content_chunk_drops_degenerate() {
+        // These are the chunks that poison retrieval: near-empty fragments
+        // (YAML frontmatter fences, lone headers, whitespace, punctuation) whose
+        // embeddings score ~0.95 against every query.
+        assert!(is_low_content_chunk("---"));
+        assert!(is_low_content_chunk("--- "));
+        assert!(is_low_content_chunk("---\n"));
+        assert!(is_low_content_chunk("   \n\t"));
+        assert!(is_low_content_chunk("##"));
+        assert!(is_low_content_chunk("- - -"));
+    }
+
+    #[test]
+    fn test_low_content_chunk_keeps_real_text() {
+        assert!(!is_low_content_chunk("cards-deck: AI::loss"));
+        assert!(!is_low_content_chunk("## Loss function"));
+        assert!(!is_low_content_chunk(
+            "What is a loss function in machine learning?"
+        ));
+        // Chinese content must be kept (alphanumeric check must count CJK).
+        assert!(!is_low_content_chunk("巴黎住宿推荐"));
+    }
+
+    #[test]
+    fn test_embedding_text_includes_title_context() {
+        let path = PathBuf::from("/Users/me/Vault/03_Resources/Incidents/tripod.md");
+        let text = embedding_text_for_chunk(&path, "![[74915__20221106124710_.jpeg]]");
+
+        assert!(text.contains("title: tripod"));
+        assert!(text.contains("03_Resources / Incidents / tripod"));
+        assert!(text.contains("![[74915__20221106124710_.jpeg]]"));
+        assert!(!text.contains("/Users/me"));
+    }
+
+    #[test]
+    fn test_exclude_matcher_hidden_files_and_dirs() {
+        // Hidden files/dirs must be excluded even when not named in patterns.
+        // This is the bug that let .obsidian/*.json pollute the index.
+        let matcher =
+            ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns, Path::new("/"));
+
+        // Files nested inside a hidden directory (e.g. a nested Obsidian vault)
+        assert!(matcher.is_excluded(Path::new("/vault/Incidents/x/.obsidian/workspace.json")));
+        assert!(matcher.is_excluded(Path::new("/vault/.obsidian")));
+        // A plain hidden file
+        assert!(matcher.is_excluded(Path::new("/vault/.DS_Store")));
+        // Inside a .git dir (multi-`**` pattern that the old matcher never caught)
+        assert!(matcher.is_excluded(Path::new("/proj/.git/config")));
+    }
+
+    #[test]
+    fn test_exclude_matcher_keeps_normal_files() {
+        let matcher =
+            ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns, Path::new("/"));
+
+        assert!(!matcher.is_excluded(Path::new("/vault/Photography/Milky way.md")));
+        assert!(!matcher.is_excluded(Path::new("/vault/Notes/deep/sub/note.md")));
+    }
+
+    #[test]
+    fn test_exclude_matcher_root_under_hidden_dir() {
+        // When the index root itself lives under a hidden directory, the root's
+        // own ancestry must NOT exclude everything inside it.
+        let root = Path::new("/home/u/.notes/vault");
+        let matcher = ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns, root);
+
+        assert!(!matcher.is_excluded(Path::new("/home/u/.notes/vault/Note.md")));
+        assert!(!matcher.is_excluded(Path::new("/home/u/.notes/vault/sub/deep.md")));
+        // But a hidden dir *inside* the vault is still excluded.
+        assert!(matcher.is_excluded(Path::new("/home/u/.notes/vault/.obsidian/app.json")));
+        assert!(matcher.is_excluded(Path::new("/home/u/.notes/vault/.DS_Store")));
+    }
+
+    #[test]
+    fn test_exclude_matcher_named_patterns() {
+        let matcher =
+            ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns, Path::new("/"));
+
+        assert!(matcher.is_excluded(Path::new("/proj/node_modules/pkg/index.js")));
+        assert!(matcher.is_excluded(Path::new("/proj/target/debug/foo")));
+        assert!(matcher.is_excluded(Path::new("/proj/Cargo.lock")));
+    }
+
+    #[test]
+    fn test_exclude_matcher_custom_glob() {
+        // Custom user pattern, e.g. dropping all png/jpg.
+        let patterns = vec!["**/*.png".to_string(), "**/*.jpg".to_string()];
+        let matcher = ExcludeMatcher::new(&patterns, Path::new("/"));
+
+        assert!(matcher.is_excluded(Path::new("/vault/attachments/scan.png")));
+        assert!(matcher.is_excluded(Path::new("/vault/a/b/photo.jpg")));
+        assert!(!matcher.is_excluded(Path::new("/vault/note.md")));
+    }
+
+    #[test]
+    fn test_default_excludes_secret_files() {
+        // Unambiguous secret files must be excluded by default so a networked
+        // `ragfs serve` never returns their contents.
+        let matcher =
+            ExcludeMatcher::new(&IndexerConfig::default().exclude_patterns, Path::new("/"));
+
+        assert!(matcher.is_excluded(Path::new("/vault/deploy.key")));
+        assert!(matcher.is_excluded(Path::new("/vault/certs/server.pem")));
+        assert!(matcher.is_excluded(Path::new("/vault/passwords.kdbx")));
+        assert!(matcher.is_excluded(Path::new("/vault/.ssh/id_rsa")));
+        // Ordinary notes are still indexed.
+        assert!(!matcher.is_excluded(Path::new("/vault/Notes/keyboard shortcuts.md")));
+    }
+
+    #[test]
+    fn test_read_ragfsignore_parses_lines() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".ragfsignore"),
+            "# secrets\n\n**/Vault/**\n  *.env  \n# trailing comment\nprivate/\n",
+        )
+        .unwrap();
+
+        let patterns = read_ragfsignore(dir.path());
+        assert_eq!(patterns, vec!["**/Vault/**", "*.env", "private/"]);
+    }
+
+    #[test]
+    fn test_ragfsignore_missing_is_empty() {
+        let dir = tempdir().unwrap();
+        assert!(read_ragfsignore(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_ragfsignore_found_in_ancestor() {
+        // A vault-root .ragfsignore must protect a subfolder indexed on its own.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".ragfsignore"), "**/Vault/**\n").unwrap();
+        let sub = dir.path().join("03_Resources");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let matcher = ExcludeMatcher::new(&[], &sub);
+        assert!(matcher.is_excluded(&sub.join("Vault/secret.md")));
+        assert!(!matcher.is_excluded(&sub.join("Photography/note.md")));
+    }
+
+    #[test]
+    fn test_exclude_matcher_honors_ragfsignore() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".ragfsignore"), "**/Vault/**\nprivate/\n").unwrap();
+
+        // No explicit patterns — everything comes from .ragfsignore.
+        let matcher = ExcludeMatcher::new(&[], dir.path());
+
+        let secret = dir.path().join("03_Resources/Vault/backup keys.md");
+        let in_private = dir.path().join("private/notes.md");
+        let normal = dir.path().join("03_Resources/Photography/Milky way.md");
+
+        assert!(matcher.is_excluded(&secret));
+        assert!(matcher.is_excluded(&in_private)); // trailing-slash dir pattern
+        assert!(!matcher.is_excluded(&normal));
+    }
+
+    #[test]
+    fn test_watch_events_honor_excludes() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".ragfsignore"), "**/Vault/**\n").unwrap();
+        let config = IndexerConfig::default();
+
+        assert!(should_skip_watch_event(
+            &dir.path().join("03_Resources/Vault/backup keys.md"),
+            dir.path(),
+            &config
+        ));
+        assert!(should_skip_watch_event(
+            &dir.path().join("03_Resources/deploy.key"),
+            dir.path(),
+            &config
+        ));
+        assert!(!should_skip_watch_event(
+            &dir.path().join("03_Resources/Photography/Milky way.md"),
+            dir.path(),
+            &config
+        ));
+    }
+
+    #[test]
+    fn test_watch_events_reread_ragfsignore() {
+        let dir = tempdir().unwrap();
+        let config = IndexerConfig::default();
+        let path = dir.path().join("private/new secret.md");
+
+        assert!(!should_skip_watch_event(&path, dir.path(), &config));
+
+        std::fs::write(dir.path().join(".ragfsignore"), "private/\n").unwrap();
+
+        assert!(should_skip_watch_event(&path, dir.path(), &config));
     }
 }
