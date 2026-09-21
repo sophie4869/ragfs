@@ -11,6 +11,9 @@ permissions:
 jobs:
   release-plz:
     name: Release-plz
+    # Release automation runs only on the canonical upstream repo. On forks it
+    # would 403 (Actions can't open PRs) and there's nothing to publish, so skip.
+    if: github.repository == 'Venere-Labs/ragfs'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -17,6 +17,9 @@ concurrency:
 jobs:
   build:
     name: Build Documentation
+    # GitHub Pages deploy runs only on the canonical upstream repo; forks don't
+    # have Pages configured, so skip (the `deploy` job needs this one).
+    if: github.repository == 'Venere-Labs/ragfs'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
