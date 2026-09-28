@@ -12,6 +12,7 @@ on:
 permissions:
   contents: read
   checks: write
+  issues: write # audit-check files an issue per advisory on scheduled runs
 
 jobs:
   audit:
